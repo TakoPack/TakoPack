@@ -50,7 +50,11 @@ impl DebInfo {
         let upstream_name = crate_info.package_id().name().to_string();
         let name_dashed = base_deb_name(&upstream_name);
         let base_package_name = name_dashed.to_lowercase();
+        let deb_upstream_version = deb_upstream_version(crate_info.version());
+
         let (name_suffix, uscan_version_pattern, package_name) = if semver_suffix {
+            // semver now includes full version for prerelease (e.g., 0.26.0-beta.1)
+            // and compat version for normal releases (e.g., 0.26 or 1.0)
             let semver = crate_info.semver();
             let name_suffix = format!("-{}", &semver);
             // See `man uscan` description of @ANY_VERSION@ on how these
@@ -61,7 +65,6 @@ impl DebInfo {
         } else {
             (None, None, base_package_name.clone())
         };
-        let deb_upstream_version = deb_upstream_version(crate_info.version());
         let package_source_dir = PathBuf::from(format!(
             "{}-{}-{}",
             Source::pkg_prefix(),
@@ -311,6 +314,8 @@ pub fn prepare_takopack_folder(
     changelog_ready: bool,
     copyright_guess_harder: bool,
     overlay_write_back: bool,
+    sha256: Option<String>, // SHA256 hash of downloaded crate
+    lockfile_deps: Option<std::collections::HashMap<String, semver::Version>>, // Optional: dependencies from Cargo.lock
 ) -> Result<()> {
     let mut create = fs::OpenOptions::new();
     create.write(true).create_new(true);
@@ -360,8 +365,14 @@ pub fn prepare_takopack_folder(
     }
 
     // takopack/control & takopack/tests/control
-    let (source, has_dev_depends, default_test_broken) =
-        prepare_takopack_control(deb_info, crate_info, config, &mut file)?;
+    let (source, has_dev_depends, default_test_broken) = prepare_takopack_control(
+        deb_info,
+        crate_info,
+        config,
+        sha256,
+        lockfile_deps.as_ref(),
+        &mut file,
+    )?;
 
     // for testing only, takopack/takopack_testing_bin/env
     if testing_ignore_debpolv() {
@@ -460,6 +471,8 @@ fn prepare_takopack_control<F: FnMut(&str) -> std::result::Result<fs::File, io::
     deb_info: &DebInfo,
     crate_info: &CrateInfo,
     config: &Config,
+    sha256: Option<String>, // SHA256 hash of downloaded crate
+    lockfile_deps: Option<&HashMap<String, semver::Version>>, // Optional lockfile dependencies
     mut file: F,
 ) -> Result<(Source, bool, bool)> {
     // println!("-----------");
@@ -509,7 +522,7 @@ fn prepare_takopack_control<F: FnMut(&str) -> std::result::Result<fs::File, io::
     // }
     let dev_depends = deb_deps(config.allow_prerelease_deps, &crate_info.dev_dependencies())?;
     let has_dev_deps = !dev_depends.is_empty();
-    log::trace!(
+    log::debug!(
         "features_with_deps: {:?}",
         features_with_deps
             .iter()
@@ -608,10 +621,10 @@ fn prepare_takopack_control<F: FnMut(&str) -> std::result::Result<fs::File, io::
     let license = meta.license.as_deref().unwrap_or("");
 
     // Construct download URL for crates.io
+    let full_version = crate_info.version().to_string(); // Include build metadata
     let download_url = format!(
         "https://crates.io/api/v1/crates/{}/{}/download",
-        crate_name,
-        crate_info.version()
+        crate_name, &full_version
     );
 
     let mut source = Source::new(
@@ -628,6 +641,8 @@ fn prepare_takopack_control<F: FnMut(&str) -> std::result::Result<fs::File, io::
         build_deps,
         requires_root.cloned(),
         download_url,
+        full_version,
+        sha256,
     )?;
 
     // If source overrides are present update related parts.
@@ -636,7 +651,6 @@ fn prepare_takopack_control<F: FnMut(&str) -> std::result::Result<fs::File, io::
     let spec_filename = format!("rust-{}.spec", crate_name.replace('_', "-"));
     let mut control = io::BufWriter::new(file(&spec_filename)?);
     write!(control, "{}", source)?;
-
     // Summary and description generated from Cargo.toml
     let (crate_summary, crate_description) = crate_info.get_summary_description();
     let summary_prefix = crate_summary.unwrap_or(format!("Rust crate \"{}\"", crate_name));
@@ -652,6 +666,7 @@ fn prepare_takopack_control<F: FnMut(&str) -> std::result::Result<fs::File, io::
     let mut package_names: Vec<String> = Vec::new(); // Track all package names for %files section
 
     if lib {
+        // Library crate: generate full feature packages
         // takopack/tests/control
         let all_features: Vec<&str> = features_with_deps.keys().copied().collect();
         let all_features_test_broken = match test_is_marked_broken("@") {
@@ -763,6 +778,12 @@ fn prepare_takopack_control<F: FnMut(&str) -> std::result::Result<fs::File, io::
                 .map(|(&f, (ff, dd))| { (f, (ff, dd.iter().map(show_dep).collect::<Vec<_>>())) })
                 .collect::<Vec<_>>()
         );
+        // Save original features list before reduce_provides removes some
+        let original_features: Vec<String> = working_features_with_deps
+            .keys()
+            .filter(|&k| !k.is_empty())
+            .map(|k| k.to_string())
+            .collect();
         let (mut provides, reduced_features_with_deps) = if config.collapse_features {
             collapse_features(working_features_with_deps)
         } else {
@@ -794,6 +815,22 @@ fn prepare_takopack_control<F: FnMut(&str) -> std::result::Result<fs::File, io::
         no_features_edge_case.insert("", (vec![], vec![]));
         no_features_edge_case.insert("default", (vec![""], vec![]));
         let no_features_edge_case = features_with_deps == no_features_edge_case;
+
+        // Collect all features that will be provided by subpackages
+        // This includes both the subpackage's own feature and any features merged into it
+        let mut all_subpackage_features: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for (&feature, _) in reduced_features_with_deps.iter() {
+            if !feature.is_empty() {
+                all_subpackage_features.insert(feature.to_string());
+                // Also add all features that are provided by this subpackage
+                if let Some(merged_features) = provides.get(feature) {
+                    for &merged_feat in merged_features.iter() {
+                        all_subpackage_features.insert(merged_feat.to_string());
+                    }
+                }
+            }
+        }
 
         for (feature, (f_deps, o_deps)) in reduced_features_with_deps.into_iter() {
             let pk = PackageKey::feature(feature);
@@ -837,6 +874,19 @@ fn prepare_takopack_control<F: FnMut(&str) -> std::result::Result<fs::File, io::
             // for dep in o_deps.iter() {
             //     println!("deps {:?} version {:?}",dep.package_name(),dep.version_req());
             // }
+
+            // Prepare all_features list: only for main package (empty feature)
+            let package_all_features = if feature.is_empty() {
+                // Main package provides all original features EXCEPT those provided by subpackages
+                original_features
+                    .iter()
+                    .filter(|f| !all_subpackage_features.contains(*f))
+                    .cloned()
+                    .collect()
+            } else {
+                vec![]
+            };
+
             let mut package = Package::new(
                 base_pkgname,
                 name_suffix,
@@ -868,7 +918,13 @@ fn prepare_takopack_control<F: FnMut(&str) -> std::result::Result<fs::File, io::
                 } else {
                     vec![]
                 },
+                package_all_features,
             )?;
+
+            if let Some(lockfile) = lockfile_deps {
+                package.apply_lockfile_deps(lockfile);
+            }
+
             // If any overrides present for this package it will be taken care.
             package.apply_overrides(config, pk, f_provides);
 
@@ -946,6 +1002,47 @@ fn prepare_takopack_control<F: FnMut(&str) -> std::result::Result<fs::File, io::
         }
         assert!(provides.is_empty());
         // reduced_features_with_deps consumed by into_iter, no longer usable
+    } else if !bins.is_empty() {
+        // Binary-only crate (no lib): generate a base package with dependencies
+        // Extract dependencies from the empty feature (base dependencies)
+        let empty_deps = (vec![], vec![]);
+        let (_, base_deps) = features_with_deps.get("").unwrap_or(&empty_deps);
+
+        let description_suffix = format!(
+            "This package contains the following binaries built from the Rust crate\n\"{}\":\n - {}",
+            crate_name,
+            bins.join("\n - ")
+        );
+
+        let mut package = Package::new(
+            base_pkgname,
+            name_suffix,
+            crate_info.version(),
+            Description {
+                prefix: summary_prefix.clone(),
+                suffix: " - Rust source code".to_string(),
+            },
+            Description {
+                prefix: description_prefix.clone(),
+                suffix: description_suffix,
+            },
+            None,   // No feature
+            vec![], // No feature dependencies
+            deb_deps(config.allow_prerelease_deps, base_deps)?,
+            base_deps.clone(),
+            vec![], // No additional provides
+            vec![], // No recommends
+            vec![], // No suggests
+            vec![], // No all_features for source package
+        )?;
+
+        if let Some(lockfile) = lockfile_deps {
+            package.apply_lockfile_deps(lockfile);
+        }
+
+        package.apply_overrides(config, PackageKey::feature(""), vec![]);
+        write!(control, "{}", package)?;
+        package_names.push("".to_string());
     }
 
     if !bins.is_empty() {
@@ -976,6 +1073,10 @@ fn prepare_takopack_control<F: FnMut(&str) -> std::result::Result<fs::File, io::
             },
         );
 
+        if let Some(lockfile) = lockfile_deps {
+            bin_pkg.apply_lockfile_deps(lockfile);
+        }
+
         // Binary package overrides.
         bin_pkg.apply_overrides(config, PackageKey::Bin, vec![]);
         // Skip bin package output for RPM spec - we only need library packages
@@ -991,37 +1092,8 @@ fn prepare_takopack_control<F: FnMut(&str) -> std::result::Result<fs::File, io::
         }
     }
 
+    writeln!(control)?;
     // Add RPM spec file sections: %conf, %build, %install, %check, %files, %changelog
-    writeln!(control, "\n%conf")?;
-    writeln!(control, "# Library package - no configure needed.")?;
-    writeln!(control)?;
-    writeln!(control, "%build")?;
-    writeln!(control, "# Library package - no build needed.")?;
-    writeln!(control)?;
-    writeln!(control, "%install")?;
-    writeln!(control, "# Install source code for library package.")?;
-    writeln!(control, "rm -f Cargo.lock")?;
-    writeln!(
-        control,
-        "install -d %{{buildroot}}%{{_datadir}}/cargo/registry/%{{crate_name}}-%{{version}}"
-    )?;
-    writeln!(
-        control,
-        "cp -a * %{{buildroot}}%{{_datadir}}/cargo/registry/%{{crate_name}}-%{{version}}/"
-    )?;
-    writeln!(
-        control,
-        "# Remove old cargo-checksum.json and create new .cargo-checksum.json"
-    )?;
-    writeln!(control, "rm -f %{{buildroot}}%{{_datadir}}/cargo/registry/%{{crate_name}}-%{{version}}/*checksum.json")?;
-    writeln!(
-        control,
-        r#"echo '{{"files":{{}},"package":null}}' > %{{buildroot}}%{{_datadir}}/cargo/registry/%{{crate_name}}-%{{version}}/.cargo-checksum.json"#
-    )?;
-    writeln!(control)?;
-    writeln!(control, "# No tests here.")?;
-    writeln!(control, "%check")?;
-    writeln!(control)?;
     writeln!(control, "%files")?;
     writeln!(
         control,
@@ -1032,18 +1104,10 @@ fn prepare_takopack_control<F: FnMut(&str) -> std::result::Result<fs::File, io::
     // Add %files for each feature package
     for feature in &package_names {
         if !feature.is_empty() {
-            // Need to extract relative package name same way as Package::Display does
-            let base_name = base_deb_name(crate_name);
             let feature_name = base_deb_name(feature);
-
-            // Check if this should be merged to main package
-            let should_merge =
-                base_name.ends_with(&format!("-{}", feature_name)) || base_name == feature_name;
-
-            if !should_merge {
-                writeln!(control, "%files -n %{{name}}+{}", feature_name)?;
-                writeln!(control)?;
-            }
+            let feature_base_trimmed = feature_name.trim_start_matches('-');
+            writeln!(control, "%files -n %{{name}}+{}", feature_base_trimmed)?;
+            writeln!(control)?;
         }
     }
 

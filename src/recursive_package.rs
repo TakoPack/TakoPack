@@ -299,6 +299,7 @@ impl RecursivePackager {
             changelog_ready: false,
             copyright_guess_harder: false,
             no_overlay_write_back: true,
+            lockfile_deps: None, // recursive command uses Cargo.toml dependencies
         };
 
         // Execute packaging

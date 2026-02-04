@@ -21,6 +21,7 @@ use glob::Pattern;
 use itertools::Itertools;
 use regex::Regex;
 use semver::Version;
+use sha2::{Digest, Sha256};
 use tar::Archive;
 use tempfile;
 
@@ -238,6 +239,66 @@ impl CrateInfo {
         })
     }
 
+    /// Create CrateInfo directly from a Cargo.toml path (no source code required)
+    pub fn new_with_local_crate_from_path(cargo_toml: &Path) -> Result<CrateInfo> {
+        let context = GlobalContext::default()?;
+        let crate_dir = cargo_toml.parent().unwrap();
+
+        // Check if we have a complete crate with src/
+        let has_src = crate_dir.join("src").exists();
+
+        if has_src {
+            // Use path source for complete crates
+            let source_id = SourceId::for_path(crate_dir)?;
+            let manifest = match read_manifest(cargo_toml, source_id, &context)? {
+                EitherManifest::Real(m) => m,
+                _ => anyhow::bail!("Virtual manifests are not supported"),
+            };
+
+            let crate_name = manifest.name().as_str();
+            let version = manifest.version().to_string();
+            Self::new_with_local_crate(crate_name, Some(&version), crate_dir)
+        } else {
+            // For standalone Cargo.toml without source code, use a dummy source_id
+            log::info!("Creating CrateInfo from standalone Cargo.toml without source code");
+
+            // Use registry source_id since we don't have a real path source
+            let source_id = SourceId::crates_io_maybe_sparse_http(&context)?;
+
+            let manifest = match read_manifest(cargo_toml, source_id, &context)? {
+                EitherManifest::Real(m) => m,
+                _ => anyhow::bail!("Virtual manifests are not supported"),
+            };
+
+            let crate_name = manifest.name().as_str();
+            let version = manifest.version().to_string();
+
+            // Create Package directly from manifest
+            let package = Package::new(manifest.clone(), cargo_toml);
+
+            // Create a dummy crate file
+            let target_dir = context
+                .target_dir()?
+                .ok_or_else(|| anyhow::anyhow!("Target directory not set"))?;
+            let package_dir = target_dir.join("package");
+            fs::create_dir_all(package_dir.as_path_unlocked())?;
+
+            let filename = format!("{}-{}.crate", crate_name, version);
+            let crate_file =
+                package_dir.open_rw_exclusive_create(filename, &context, "dummy crate file")?;
+
+            Ok(CrateInfo {
+                package,
+                manifest,
+                crate_file,
+                context,
+                source_id,
+                excludes: vec![],
+                includes: vec![],
+            })
+        }
+    }
+
     pub fn new_with_update(
         crate_name: &str,
         version: Option<&str>,
@@ -362,6 +423,7 @@ impl CrateInfo {
         self.package_id().name().as_str()
     }
 
+    /// It's a full version,like "0.9.11+spec-1.1.0"
     pub fn version(&self) -> &Version {
         self.package_id().version()
     }
@@ -446,6 +508,33 @@ impl CrateInfo {
         &self.crate_file
     }
 
+    /// Calculate SHA256 hash of the downloaded crate file
+    pub fn calculate_sha256(&self) -> Result<String> {
+        use std::io::Seek;
+
+        let mut file = self.crate_file.file();
+        // Seek to the beginning of the file
+        file.seek(std::io::SeekFrom::Start(0))?;
+
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; 8192];
+
+        loop {
+            let bytes_read = file.read(&mut buffer)?;
+            if bytes_read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..bytes_read]);
+        }
+
+        let hash = hasher.finalize();
+
+        // Reset file pointer to beginning for subsequent operations
+        file.seek(std::io::SeekFrom::Start(0))?;
+
+        Ok(format!("{:x}", hash))
+    }
+
     pub fn dependencies(&self) -> &[Dependency] {
         self.manifest.dependencies()
     }
@@ -455,6 +544,24 @@ impl CrateInfo {
         let mut deps = vec![];
         for dep in self.dependencies() {
             if dep.kind() == DepKind::Development {
+                // Skip dependencies with prerelease versions (e.g., 0.2.5-dev)
+                // These are typically development versions and not needed for packaging
+                let version_str = dep.version_req().to_string();
+
+                // Check if version string contains prerelease markers
+                if version_str.contains("-dev")
+                    || version_str.contains("-alpha")
+                    || version_str.contains("-beta")
+                    || version_str.contains("-rc")
+                {
+                    log::debug!(
+                        "Skipping dev-dependency with prerelease version: {} {}",
+                        dep.package_name(),
+                        version_str
+                    );
+                    continue;
+                }
+
                 deps.push(dep.clone())
             }
         }
@@ -733,6 +840,48 @@ impl CrateInfo {
         }
         Ok(source_modified)
     }
+
+    /// Generate Cargo.lock file in the extracted crate directory using cargo API
+    /// This is equivalent to running `cargo generate-lockfile`
+    /// Returns true if lockfile was successfully generated, false on failure (with warning logged)
+    pub fn generate_cargo_lock(&self, extract_path: &Path) -> Result<bool> {
+        let toml_path = extract_path.join("Cargo.toml");
+
+        if !toml_path.exists() {
+            log::warn!(
+                "Cargo.toml not found at {:?}, cannot generate Cargo.lock",
+                toml_path
+            );
+            return Ok(false);
+        }
+
+        // Try to generate lockfile using cargo API
+        match self._generate_lockfile_internal(&toml_path) {
+            Ok(()) => {
+                log::info!(
+                    "Successfully generated Cargo.lock at {:?}",
+                    extract_path.join("Cargo.lock")
+                );
+                Ok(true)
+            }
+            Err(e) => {
+                log::warn!("Failed to generate Cargo.lock: {:?}", e);
+                Ok(false)
+            }
+        }
+    }
+
+    /// Internal helper to generate lockfile using cargo API
+    fn _generate_lockfile_internal(&self, toml_path: &Path) -> Result<()> {
+        // Create a workspace from the Cargo.toml
+        let ws = Workspace::new(&toml_path.canonicalize()?, &self.context)?;
+
+        // Generate the lockfile using cargo's ops module
+        // This is equivalent to `cargo generate-lockfile`
+        ops::generate_lockfile(&ws)?;
+
+        Ok(())
+    }
 }
 
 /// Collect information about the dependency structure of features and
@@ -861,15 +1010,33 @@ pub fn all_dependencies_and_features_filtered(
 /// `all_dependencies_and_features`.
 pub fn transitive_deps<'a>(
     features_with_deps: &'a CrateDepInfo,
-    feature: &str,
+    feature: &'a str,
 ) -> Result<(Vec<&'a str>, Vec<Dependency>)> {
+    let mut visited = HashSet::new();
+    transitive_deps_impl(features_with_deps, feature, &mut visited)
+}
+
+/// Internal implementation of transitive_deps with cycle detection
+fn transitive_deps_impl<'a>(
+    features_with_deps: &'a CrateDepInfo,
+    feature: &'a str,
+    visited: &mut HashSet<&'a str>,
+) -> Result<(Vec<&'a str>, Vec<Dependency>)> {
+    // Check for cycles
+    if visited.contains(feature) {
+        // Cycle detected, return empty to break the recursion
+        return Ok((vec![], vec![]));
+    }
+
+    visited.insert(feature);
+
     let mut all_features = Vec::new();
     let mut all_deps = Vec::new();
     if let Some((ff, dd)) = features_with_deps.get(feature) {
         all_features.extend(ff.clone());
         all_deps.extend(dd.clone());
         for f in ff {
-            let (ff1, dd1) = transitive_deps(features_with_deps, f)?;
+            let (ff1, dd1) = transitive_deps_impl(features_with_deps, f, visited)?;
             all_features.extend(ff1);
             all_deps.extend(dd1);
         }

@@ -14,11 +14,23 @@ enum V {
     M(u64),
     MM(u64, u64),
     MMP(u64, u64, u64),
+    // For prerelease versions like 0.26.0-beta.1
+    Prerelease(u64, u64, u64, String),
 }
 
 impl V {
     fn new(p: &semver::Comparator) -> Result<Self> {
         use self::V::*;
+
+        // Check if this has a prerelease part
+        if !p.pre.is_empty() {
+            let major = p.major;
+            let minor = p.minor.unwrap_or(0);
+            let patch = p.patch.unwrap_or(0);
+            let pre = p.pre.to_string();
+            return Ok(Prerelease(major, minor, patch, pre));
+        }
+
         let mmp = match (p.minor, p.patch) {
             (None, None) => M(p.major),
             (Some(minor), None) => MM(p.major, minor),
@@ -34,6 +46,10 @@ impl V {
             M(major) => M(major + 1),
             MM(major, minor) => MM(major, minor + 1),
             MMP(major, minor, patch) => MMP(major, minor, patch + 1),
+            Prerelease(major, minor, patch, ref pre) => {
+                // For prerelease versions, increment patch and keep prerelease
+                Prerelease(major, minor, patch + 1, pre.clone())
+            }
         }
     }
 
@@ -43,6 +59,7 @@ impl V {
             M(major) => (major, 0, 0),
             MM(major, minor) => (major, minor, 0),
             MMP(major, minor, patch) => (major, minor, patch),
+            Prerelease(major, minor, patch, _) => (major, minor, patch),
         }
     }
 }
@@ -72,6 +89,9 @@ impl fmt::Display for V {
             M(major) => write!(f, "{}", major),
             MM(major, minor) => write!(f, "{}.{}", major, minor),
             MMP(major, minor, patch) => write!(f, "{}.{}.{}", major, minor, patch),
+            Prerelease(major, minor, patch, ref pre) => {
+                write!(f, "{}.{}.{}-{}", major, minor, patch, pre)
+            }
         }
     }
 }
@@ -190,19 +210,13 @@ fn coerce_unacceptable_predicate<'a>(
     // handle pre-release crates. This might be OK most of the time,
     // coerce it to the non-pre-release version.
     if !p.pre.is_empty() {
-        if allow_prerelease_deps || testing_ignore_debpolv() {
-            takopack_warn!(
-                "Coercing removal of prerelease part of dependency: {} {:?}",
-                dep.package_name(),
-                p
-            )
-        } else {
-            takopack_bail!(
-                "Cannot represent prerelease part of dependency: {} {:?}",
-                dep.package_name(),
-                p
-            )
-        }
+        // For dependencies with prerelease versions (e.g., 0.26.0-beta.1),
+        // we allow them and will record the full version including prerelease part
+        takopack_warn!(
+            "Dependency has prerelease version, will use full version: {} {:?}",
+            dep.package_name(),
+            p
+        )
     }
 
     use semver::Op::*;
@@ -280,6 +294,24 @@ fn generate_version_constraints(
         }
         (Caret, &MMP(major, _, _)) | (Caret, &MM(major, _)) | (Caret, &M(major)) => {
             vr.constrain_lt(M(major + 1));
+            vr.constrain_ge(mmp);
+        }
+        // Handle Prerelease versions with Caret operator
+        (Caret, &Prerelease(0, 0, _, _)) => {
+            vr.constrain_lt(mmp.inclast());
+            vr.constrain_ge(mmp);
+        }
+        (Caret, &Prerelease(0, minor, _, _)) => {
+            vr.constrain_lt(MM(0, minor + 1));
+            vr.constrain_ge(mmp);
+        }
+        (Caret, &Prerelease(major, _, _, _)) => {
+            vr.constrain_lt(M(major + 1));
+            vr.constrain_ge(mmp);
+        }
+        // Handle Prerelease versions with Tilde operator
+        (Tilde, &Prerelease(major, minor, _, _)) => {
+            vr.constrain_lt(MM(major, minor + 1));
             vr.constrain_ge(mmp);
         }
 

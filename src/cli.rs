@@ -70,4 +70,61 @@ pub enum CargoOpt {
         #[arg(short, long, value_name = "DIR")]
         output: Option<std::path::PathBuf>,
     },
+    /// Batch process multiple crates from a text file (one crate per line: "crate_name version")
+    #[command(name = "batch")]
+    Batch {
+        /// Path to text file containing crate list (one per line: "name version")
+        #[arg(value_name = "FILE")]
+        file: std::path::PathBuf,
+
+        /// Output directory for generated spec files (default: timestamped directory)
+        #[arg(short, long, value_name = "DIR")]
+        output: Option<std::path::PathBuf>,
+    },
+    /// Package from a local crate directory (with Cargo.toml)
+    #[command(name = "localpkg", alias = "local")]
+    LocalPackage {
+        /// Path to directory containing Cargo.toml (or path to Cargo.toml itself)
+        #[arg(value_name = "PATH")]
+        path: std::path::PathBuf,
+
+        /// Output directory for generated spec file (default: current directory)
+        #[arg(short, long, value_name = "DIR")]
+        output: Option<std::path::PathBuf>,
+
+        #[command(flatten)]
+        finish: PackageExecuteArgs,
+    },
+    /// Track dependencies from a crate and generate action list
+    #[command(name = "track")]
+    #[command(group(
+        clap::ArgGroup::new("source")
+            .required(true)
+            .args(&["crate_name", "from_file"]),
+    ))]
+    Track {
+        /// Crate name
+        #[arg(value_name = "CRATE")]
+        crate_name: Option<String>,
+
+        /// Crate version (optional, uses latest if not specified)
+        #[arg(value_name = "VERSION")]
+        version: Option<String>,
+
+        /// Path to Cargo.toml or Cargo.lock file
+        #[arg(short = 'f', long, value_name = "FILE")]
+        from_file: Option<std::path::PathBuf>,
+
+        /// Output directory for generated specs (default: track_TIMESTAMP/)
+        #[arg(short = 'o', long, value_name = "DIR")]
+        output: Option<std::path::PathBuf>,
+
+        /// Database file (default: ~/.config/takopack/crate_db.txt)
+        #[arg(long, value_name = "FILE")]
+        database: Option<std::path::PathBuf>,
+
+        /// Output file for crates that need action (default: needs_action.txt)
+        #[arg(long, value_name = "FILE")]
+        action_file: Option<std::path::PathBuf>,
+    },
 }

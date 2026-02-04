@@ -1,7 +1,7 @@
 use clap::Parser;
 use nu_ansi_term::Color::Red;
 
-use takopack::cli::{Cli, Opt};
+use takopack::cli::{CargoOpt, Cli, Opt};
 use takopack::crates::invalidate_crates_io_cache;
 use takopack::errors::Result;
 use takopack::package::*;
@@ -19,7 +19,6 @@ fn real_main() -> Result<()> {
     use Opt::*;
     match m.command {
         Cargo(cargo_opt) => {
-            use takopack::cli::CargoOpt;
             match cargo_opt {
                 CargoOpt::Update => invalidate_crates_io_cache(),
                 CargoOpt::Package {
@@ -36,22 +35,25 @@ fn real_main() -> Result<()> {
                     // Get crate name and version
                     let crate_name = process.crate_info().crate_name();
                     let version = process.crate_info().version();
+
+                    // Calculate compatibility version following Rust semver rules
+                    let compat_version = takopack::util::calculate_compat_version(version);
+
                     let output_dirname =
-                        format!("rust-{}-{}", crate_name.replace('_', "-"), version);
+                        format!("rust-{}-{}", crate_name.replace('_', "-"), compat_version);
                     let spec_filename = format!("rust-{}.spec", crate_name.replace('_', "-"));
                     let final_output = PathBuf::from(&output_dirname);
 
-                    log::info!("extracting crate");
                     process.extract(extract)?;
-                    log::info!("applying overlay and patches");
                     process.apply_overrides()?;
-                    log::info!("preparing orig tarball");
                     process.prepare_orig_tarball()?;
-                    log::info!("preparing takopack folder");
                     process.prepare_takopack_folder(finish)?;
 
                     // After prepare_takopack_folder, the spec file is in output_dir/takopack/
                     let output_path = process.output_dir.as_ref().unwrap();
+                    log::debug!("output_path: {}", output_path.display());
+                    log::debug!("output_dirname: {}", final_output.display());
+
                     let takopack_dir = output_path.join("takopack");
                     let source_spec = takopack_dir.join(&spec_filename);
 
@@ -115,6 +117,39 @@ fn real_main() -> Result<()> {
                 CargoOpt::ParseToml { toml_path, output } => {
                     log::info!("parsing dependencies from Cargo.toml");
                     parse_dependencies_from_toml(&toml_path, output)?;
+                    Ok(())
+                }
+                CargoOpt::Batch { file, output } => {
+                    log::info!("starting batch operation from file: {:?}", file);
+                    takopack::batch_package::process_batch_file(&file, output)?;
+                    Ok(())
+                }
+                CargoOpt::LocalPackage {
+                    path,
+                    output,
+                    finish,
+                } => {
+                    log::info!("packaging from local directory: {:?}", path);
+                    takopack::local_package::process_local_package(&path, output, finish)?;
+                    Ok(())
+                }
+                CargoOpt::Track {
+                    crate_name,
+                    version,
+                    from_file,
+                    output,
+                    database,
+                    action_file,
+                } => {
+                    log::info!("tracking dependencies");
+                    takopack::track_command::execute_track(
+                        crate_name,
+                        version,
+                        from_file,
+                        output,
+                        database,
+                        action_file,
+                    )?;
                     Ok(())
                 }
             }

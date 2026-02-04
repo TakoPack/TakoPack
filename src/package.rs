@@ -9,13 +9,13 @@ use crate::crates::CrateInfo;
 use crate::errors::Result;
 use crate::takopack::{self, DebInfo};
 use crate::util;
-
 pub struct PackageProcess {
     // below state is filled in during init
     pub crate_info: CrateInfo,
     pub deb_info: DebInfo,
     pub config_path: Option<PathBuf>,
     pub config: Config,
+    pub sha256: Option<String>, // SHA256 hash of downloaded crate file
     // below state is filled in during the process
     /// Output directory as specified by the user.
     pub output_dir: Option<PathBuf>,
@@ -56,6 +56,10 @@ pub struct PackageExecuteArgs {
     /// Don't write back hint files or d/changelog to the source overlay directory.
     #[arg(long)]
     pub no_overlay_write_back: bool,
+    /// Optional: Dependencies from Cargo.lock for accurate spec generation
+    /// (used by track command, None for pkg/batch commands)
+    #[arg(skip)]
+    pub lockfile_deps: Option<std::collections::HashMap<String, semver::Version>>,
 }
 
 impl PackageProcess {
@@ -68,11 +72,24 @@ impl PackageProcess {
         crate_info.set_includes_excludes(config.orig_tar_excludes(), config.orig_tar_whitelist());
         let deb_info = DebInfo::new(&crate_info, crate_version!(), config.semver_suffix);
 
+        // Calculate SHA256 hash for downloaded crates
+        let sha256 = match crate_info.calculate_sha256() {
+            Ok(hash) => {
+                log::info!("Calculated SHA256: {}", hash);
+                Some(hash)
+            }
+            Err(e) => {
+                log::warn!("Failed to calculate SHA256: {:?}", e);
+                None
+            }
+        };
+
         Ok(Self {
             crate_info,
             deb_info,
             config_path,
             config,
+            sha256,
             output_dir: None,
             source_modified: None,
             temp_output_dir: None,
@@ -125,6 +142,18 @@ impl PackageProcess {
             .unwrap_or_else(|| deb_info.package_source_dir().to_path_buf());
 
         let source_modified = crate_info.extract_crate(&output_dir)?;
+
+        // Get crate info before clean (for backup)
+        let crate_name = crate_info.crate_name().to_string();
+        let version = crate_info.version().to_string();
+
+        // Backup original Cargo.toml to ~/cargo_back/origin/ (no cleaning)
+        let cargo_toml = output_dir.join("Cargo.toml");
+        if let Err(e) =
+            crate::util::backup_cargo_toml(&cargo_toml, &crate_name, &version, Some("origin"))
+        {
+            log::warn!("Failed to backup original Cargo.toml: {:?}", e);
+        }
 
         // stage finished; set vars
         self.output_dir = Some(output_dir);
@@ -186,6 +215,7 @@ impl PackageProcess {
             deb_info,
             config_path,
             config,
+            sha256,
             output_dir,
             temp_output_dir,
             ..
@@ -202,6 +232,8 @@ impl PackageProcess {
             args.changelog_ready,
             args.copyright_guess_harder,
             !args.no_overlay_write_back,
+            sha256.clone(),
+            args.lockfile_deps, // Pass lockfile dependencies
         )?;
 
         // stage finished; set vars
