@@ -619,12 +619,14 @@ impl fmt::Display for Package {
         // Also parse self.provides for additional features (e.g., std provides default)
         if let Some(crate_name) = &self.crate_name {
             let crate_base = crate_name.replace('_', "-");
+
             use std::collections::HashSet;
             let mut provided_features = HashSet::new();
 
             if relative_name.is_empty() {
                 // Main package provides crate(%{pkgname})
                 // println!("{:?}", self.crate_name);
+                writeln!(f, "Provides:       crate({crate_base}) = %{{version}}")?;
                 writeln!(f, "Provides:       crate(%{{pkgname}})")?;
                 // if self.crate_name.as_deref() == Some("md-5")
                 //     || self.crate_name.as_deref() == Some("utf-8")
