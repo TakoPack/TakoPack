@@ -1,6 +1,6 @@
 # TakoPack
 
-TakoPack 是一个用于将各种语言生态系统的软件（目前支持 Rust/Cargo）打包为 Linux 发行版 RPM spec 文件的工具。
+TakoPack 是一个用于将各种语言生态系统的软件（目前支持 Rust/Cargo 和 Python/PyPI）打包为 Linux 发行版 RPM spec 文件的工具。
 
 ## 功能特性
 
@@ -9,6 +9,7 @@ TakoPack 是一个用于将各种语言生态系统的软件（目前支持 Rust
 - **本地打包**: 直接从本地 Cargo.toml 生成 spec 文件
 - **依赖追踪**: 追踪 crate 依赖关系并生成处理列表
 - **依赖解析**: 自动解析和生成所有依赖的 spec 文件
+- **Python 打包**: 为单个 Python 包生成 RPM spec 文件
 
 ## 安装
 
@@ -24,7 +25,24 @@ cargo build --release
 
 ## 使用方法
 
-### 主要命令
+### Python 命令
+
+TakoPack 的 Python/PyPI 操作在 `py` 子命令下：
+
+```bash
+# 打包最新版本
+takopack py package <NAME>
+
+# 打包指定版本
+takopack py package <NAME> <VERSION>
+
+# 指定输出目录
+takopack py package <NAME> -o output_dir
+```
+
+Python 功能已内置：使用 `takopack py package <NAME> [VERSION] [-o output_dir]` 即可生成 Python 包对应的 RPM spec（默认输出到 `python-{srcname}/python-{srcname}.spec`）。
+
+### Cargo 命令
 
 TakoPack 的 Rust/Cargo 操作都在 `cargo` 子命令下：
 
@@ -321,7 +339,7 @@ Takopack is designed to support multiple language ecosystems:
 
 - ✅ Rust/Cargo (currently implemented)
 - 🚧 Perl/CPAN (planned)
-- 🚧 Python/PyPI (planned)
+- ✅ Python/PyPI (currently implemented)
 - 🚧 Go modules (planned)
 ## 工作流程建议
 

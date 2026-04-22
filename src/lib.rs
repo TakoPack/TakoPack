@@ -13,6 +13,7 @@ pub mod deb_dependencies;
 pub mod local_package;
 pub mod lockfile_parser;
 pub mod package;
+pub mod python_package;
 pub mod recursive_package;
 pub mod spec_from_toml;
 pub mod track_command;
