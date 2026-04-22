@@ -15,7 +15,9 @@ const FALLBACK_LICENSE: &str = "LicenseRef-Unknown-Please-Check-Manual";
 
 fn re_license_ops_with_capture() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new("(?i)\\s*(/|\\||,|\\bor\\b|\\band\\b)\\s*").unwrap())
+    // Treat textual operators only when separated by whitespace, so SPDX IDs
+    // like GPL-2.0-or-later are not split into broken tokens.
+    RE.get_or_init(|| Regex::new("(?i)(?:\\s*(?:/|\\||,)\\s*|\\s+(?:or|and)\\s+)").unwrap())
 }
 
 fn re_spdx_like_core() -> &'static Regex {
