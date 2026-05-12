@@ -1113,7 +1113,7 @@ fn prepare_takopack_control<F: FnMut(&str) -> std::result::Result<fs::File, io::
     // }
 
     writeln!(control, "%changelog")?;
-    writeln!(control, "%{{?autochangelog}}")?;
+    writeln!(control, "%autochangelog")?;
 
     Ok((source, has_dev_deps, test_is_broken("default")?))
 }
