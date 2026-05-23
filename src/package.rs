@@ -147,7 +147,7 @@ impl PackageProcess {
         let crate_name = crate_info.crate_name().to_string();
         let version = crate_info.version().to_string();
 
-        // Backup original Cargo.toml to ~/cargo_back/origin/ (no cleaning)
+        // Backup original Cargo.toml under the takopack cargo_back origin path (no cleaning)
         let cargo_toml = output_dir.join("Cargo.toml");
         if let Err(e) =
             crate::util::backup_cargo_toml(&cargo_toml, &crate_name, &version, Some("origin"))

@@ -82,7 +82,7 @@ fn track_from_crate(crate_name: &str, version: Option<String>) -> Result<PathBuf
     let lockfile_path = extract_path.join("Cargo.lock");
     log::info!("✓ Generated Cargo.lock");
 
-    // Backup Cargo.lock to ~/cargo_back/origin/
+    // Backup Cargo.lock under the takopack cargo_back origin path
     let backup_lockfile_path = crate::util::backup_cargo_lock(
         &lockfile_path,
         crate_name,

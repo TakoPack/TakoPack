@@ -139,7 +139,7 @@ fn process_complete_crate(
                 package.get("name").and_then(|n| n.as_str()),
                 package.get("version").and_then(|v| v.as_str()),
             ) {
-                // Backup original to ~/cargo_back/patch/origin/
+                // Backup original under the takopack cargo_back patch/origin path
                 if let Err(e) =
                     crate::util::backup_cargo_toml(&cargo_toml, name, version, Some("patch/origin"))
                 {

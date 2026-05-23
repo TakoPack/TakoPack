@@ -21,6 +21,18 @@ use semver::Version;
 use walkdir::WalkDir;
 pub const HINT_SUFFIX: &str = ".takopack.hint";
 
+fn cargo_back_dir() -> Result<PathBuf, anyhow::Error> {
+    use anyhow::Context;
+
+    let data_home = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+        .context("Failed to get XDG_DATA_HOME or HOME")?;
+
+    Ok(data_home.join("takopack").join("cargo_back"))
+}
+
 /// Calculate compatibility version following Rust semver rules
 /// - Prerelease versions (e.g., 0.26.0-beta.1) -> full version (0.26.0-beta.1)
 /// - BuildMetadata versions (e.g., 0.7.5+spec-1.1.0) -> full version (0.7.0)
@@ -344,9 +356,9 @@ where
     }
 }
 
-/// Backup Cargo.toml to ~/cargo_back directory
+/// Backup Cargo.toml to ${XDG_DATA_HOME:-$HOME/.local/share}/takopack/cargo_back directory
 /// File will be named as: crate_name-version.toml
-/// If subdir is provided, file will be saved in ~/cargo_back/{subdir}/
+/// If subdir is provided, file will be saved in the matching subdirectory
 pub fn backup_cargo_toml(
     cargo_toml_path: &Path,
     crate_name: &str,
@@ -355,11 +367,7 @@ pub fn backup_cargo_toml(
 ) -> Result<(), anyhow::Error> {
     use anyhow::Context;
 
-    let home_dir = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .context("Failed to get home directory")?;
-
-    let mut backup_dir = PathBuf::from(home_dir).join("cargo_back");
+    let mut backup_dir = cargo_back_dir()?;
 
     // Add subdirectory if specified (e.g., "patch" for local packages)
     if let Some(sub) = subdir {
@@ -383,9 +391,9 @@ pub fn backup_cargo_toml(
     Ok(())
 }
 
-/// Backup Cargo.lock to ~/cargo_back directory
+/// Backup Cargo.lock to ${XDG_DATA_HOME:-$HOME/.local/share}/takopack/cargo_back directory
 /// File will be named as: crate_name-version.lock
-/// If subdir is provided, file will be saved in ~/cargo_back/{subdir}/
+/// If subdir is provided, file will be saved in the matching subdirectory
 pub fn backup_cargo_lock(
     cargo_lock_path: &Path,
     crate_name: &str,
@@ -394,11 +402,7 @@ pub fn backup_cargo_lock(
 ) -> Result<PathBuf, anyhow::Error> {
     use anyhow::Context;
 
-    let home_dir = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .context("Failed to get home directory")?;
-
-    let mut backup_dir = PathBuf::from(home_dir).join("cargo_back");
+    let mut backup_dir = cargo_back_dir()?;
 
     // Add subdirectory if specified (e.g., "origin" for downloaded crates)
     if let Some(sub) = subdir {
