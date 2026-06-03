@@ -1,7 +1,7 @@
 use clap::Parser;
 use nu_ansi_term::Color::Red;
 
-use takopack::cli::{CargoOpt, Cli, Opt};
+use takopack::cli::{CargoOpt, Cli, Opt, PyOpt};
 use takopack::crates::invalidate_crates_io_cache;
 use takopack::errors::Result;
 use takopack::package::*;
@@ -154,6 +154,21 @@ fn real_main() -> Result<()> {
                 }
             }
         }
+        Opt::Py(py_opt) => match py_opt {
+            PyOpt::Package {
+                name,
+                version,
+                output,
+            } => {
+                log::info!("packaging Python package from PyPI");
+                takopack::python_package::process_python_package(
+                    &name,
+                    version.as_deref(),
+                    output,
+                )?;
+                Ok(())
+            }
+        },
     }
 }
 

@@ -25,6 +25,9 @@ pub enum Opt {
     /// Rust/Cargo package operations
     #[command(subcommand)]
     Cargo(CargoOpt),
+    /// Python package operations
+    #[command(subcommand)]
+    Py(PyOpt),
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -126,5 +129,24 @@ pub enum CargoOpt {
         /// Output file for crates that need action (default: needs_action.txt)
         #[arg(long, value_name = "FILE")]
         action_file: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum PyOpt {
+    /// Package a Python package from PyPI and generate RPM spec file
+    #[command(alias = "pkg")]
+    Package {
+        /// PyPI package name
+        #[arg(value_name = "NAME")]
+        name: String,
+
+        /// Package version (optional, latest if omitted)
+        #[arg(value_name = "VERSION")]
+        version: Option<String>,
+
+        /// Output directory for generated spec folder (default: current directory)
+        #[arg(short, long, value_name = "DIR")]
+        output: Option<std::path::PathBuf>,
     },
 }
