@@ -623,7 +623,7 @@ fn prepare_takopack_control<F: FnMut(&str) -> std::result::Result<fs::File, io::
     // Construct download URL for crates.io
     let full_version = crate_info.version().to_string(); // Include build metadata
     let download_url = format!(
-        "https://static.crates.io/api/v1/crates/{}/{}/download",
+        "https://static.crates.io/crates/{}/{}/download",
         crate_name, &full_version
     );
 

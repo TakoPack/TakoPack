@@ -267,7 +267,7 @@ impl fmt::Display for Source {
         }
         // Use full version (including build metadata) in Source URL
         // This is needed for crates like toml_datetime with versions like "0.7.5+spec-1.1.0"
-        writeln!(f, "Source:         https://static.crates.io/api/v1/crates/%{{crate_name}}/%{{full_version}}/download#/%{{name}}-%{{version}}.tar.gz")?;
+        writeln!(f, "Source:         https://static.crates.io/crates/%{{crate_name}}/%{{full_version}}/download#/%{{name}}-%{{version}}.tar.gz")?;
         writeln!(f, "BuildArch:      noarch")?;
         writeln!(f, "BuildSystem:    rustcrates")?;
         writeln!(f, "")?;
