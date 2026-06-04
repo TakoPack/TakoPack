@@ -617,8 +617,8 @@ fn prepare_takopack_control<F: FnMut(&str) -> std::result::Result<fs::File, io::
     // Get repository URL from Cargo.toml
     let repository = meta.repository.as_deref().unwrap_or("");
 
-    // Get license from Cargo.toml
-    let license = meta.license.as_deref().unwrap_or("");
+    // Get license from Cargo.toml, normalize legacy "/" separator to SPDX "OR"
+    let license = meta.license.as_deref().unwrap_or("").replace('/', " OR ");
 
     // Construct download URL for crates.io
     let full_version = crate_info.version().to_string(); // Include build metadata
@@ -634,7 +634,7 @@ fn prepare_takopack_control<F: FnMut(&str) -> std::result::Result<fs::File, io::
         crate_name,
         homepage,
         repository,
-        license,
+        &license,
         lib,
         maintainer.to_string(),
         uploaders.iter().map(|s| s.to_string()).collect(),

@@ -119,7 +119,8 @@ pub fn generate_spec_from_toml(toml_path: &Path, output_dir: Option<PathBuf>) ->
     let license = package
         .get("license")
         .and_then(|l| l.as_str())
-        .unwrap_or("MIT OR Apache-2.0");
+        .unwrap_or("MIT OR Apache-2.0")
+        .replace('/', " OR ");
 
     let homepage = package
         .get("homepage")
@@ -133,7 +134,7 @@ pub fn generate_spec_from_toml(toml_path: &Path, output_dir: Option<PathBuf>) ->
     // Generate spec file content
     let pkg_name = format!("rust-{}", name);
     let spec_content =
-        generate_spec_content(name, version, description, license, homepage, dependencies)?;
+        generate_spec_content(name, version, description, &license, homepage, dependencies)?;
 
     // Determine output path
     let output_path = if let Some(dir) = output_dir {
