@@ -2,6 +2,7 @@ use clap::{builder::styling::AnsiColor, builder::Styles, Parser, Subcommand};
 
 use crate::{
     package::{PackageExecuteArgs, PackageExtractArgs, PackageInitArgs},
+    range_audit::RangeCapabilityPolicy,
     recursive_package::RecursivePackageArgs,
 };
 
@@ -44,23 +45,15 @@ pub enum CargoOpt {
         extract: PackageExtractArgs,
         #[command(flatten)]
         finish: PackageExecuteArgs,
+        /// Policy for range-capability warnings (warn|error|allow)
+        #[arg(long, value_enum, default_value_t = RangeCapabilityPolicy::Warn)]
+        range_capability_policy: RangeCapabilityPolicy,
     },
     /// Recursively package a crate and all its dependencies (vendor mode)
     #[command(alias = "v")]
     Vendor {
         #[command(flatten)]
         args: RecursivePackageArgs,
-    },
-    /// Generate spec file from a local Cargo.toml (without downloading)
-    #[command(name = "fromtoml", alias = "from")]
-    FromToml {
-        /// Path to Cargo.toml file
-        #[arg(value_name = "CARGO_TOML")]
-        toml_path: std::path::PathBuf,
-
-        /// Output directory for generated spec file
-        #[arg(short, long, value_name = "DIR")]
-        output: Option<std::path::PathBuf>,
     },
     /// Parse Cargo.toml dependencies and recursively generate spec files for all
     #[command(name = "parsetoml", alias = "parse")]
@@ -69,8 +62,8 @@ pub enum CargoOpt {
         #[arg(value_name = "CARGO_TOML")]
         toml_path: std::path::PathBuf,
 
-        /// Output directory for generated spec files (default: timestamped directory)
-        #[arg(short, long, value_name = "DIR")]
+        /// Output root directory. Each package is generated under this root.
+        #[arg(short, long, value_name = "OUT_ROOT")]
         output: Option<std::path::PathBuf>,
     },
     /// Batch process multiple crates from a text file (one crate per line: "crate_name version")
@@ -80,8 +73,8 @@ pub enum CargoOpt {
         #[arg(value_name = "FILE")]
         file: std::path::PathBuf,
 
-        /// Output directory for generated spec files (default: timestamped directory)
-        #[arg(short, long, value_name = "DIR")]
+        /// Output root directory. Each package is generated under this root.
+        #[arg(short, long, value_name = "OUT_ROOT")]
         output: Option<std::path::PathBuf>,
     },
     /// Package from a local crate directory (with Cargo.toml)
@@ -91,44 +84,21 @@ pub enum CargoOpt {
         #[arg(value_name = "PATH")]
         path: std::path::PathBuf,
 
-        /// Output directory for generated spec file (default: current directory)
-        #[arg(short, long, value_name = "DIR")]
+        /// Final output package directory. Files are written directly into this directory.
+        #[arg(
+            short = 'o',
+            long = "directory",
+            alias = "output",
+            value_name = "OUT_DIR"
+        )]
         output: Option<std::path::PathBuf>,
 
         #[command(flatten)]
         finish: PackageExecuteArgs,
-    },
-    /// Track dependencies from a crate and generate action list
-    #[command(name = "track")]
-    #[command(group(
-        clap::ArgGroup::new("source")
-            .required(true)
-            .args(&["crate_name", "from_file"]),
-    ))]
-    Track {
-        /// Crate name
-        #[arg(value_name = "CRATE")]
-        crate_name: Option<String>,
 
-        /// Crate version (optional, uses latest if not specified)
-        #[arg(value_name = "VERSION")]
-        version: Option<String>,
-
-        /// Path to Cargo.toml or Cargo.lock file
-        #[arg(short = 'f', long, value_name = "FILE")]
-        from_file: Option<std::path::PathBuf>,
-
-        /// Output directory for generated specs (default: track_TIMESTAMP/)
-        #[arg(short = 'o', long, value_name = "DIR")]
-        output: Option<std::path::PathBuf>,
-
-        /// Database file (default: ~/.config/takopack/crate_db.txt)
-        #[arg(long, value_name = "FILE")]
-        database: Option<std::path::PathBuf>,
-
-        /// Output file for crates that need action (default: needs_action.txt)
-        #[arg(long, value_name = "FILE")]
-        action_file: Option<std::path::PathBuf>,
+        /// Policy for range-capability warnings (warn|error|allow)
+        #[arg(long, value_enum, default_value_t = RangeCapabilityPolicy::Warn)]
+        range_capability_policy: RangeCapabilityPolicy,
     },
 }
 

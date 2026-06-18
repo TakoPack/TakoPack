@@ -11,6 +11,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tar::Archive;
 
+use crate::util::write_file_ensuring_dir;
+
 const FALLBACK_LICENSE: &str = "LicenseRef-Unknown-Please-Check-Manual";
 
 fn re_license_ops_with_capture() -> &'static Regex {
@@ -63,9 +65,7 @@ pub fn process_python_package(
                 .unwrap_or("0.0.0");
             let spec_path = package_dir.join(format!("python-{}.spec", srcname));
             let spec_content = render_skeleton_spec(&srcname, skeleton_version, package_name, &e);
-            fs::write(&spec_path, spec_content).with_context(|| {
-                format!("failed to write generated spec: {}", spec_path.display())
-            })?;
+            write_file_ensuring_dir(&spec_path, spec_content.as_bytes())?;
             println!(
                 "[WARN] PyPI metadata not found for {}. Generated skeleton spec: {}",
                 package_name,
@@ -95,9 +95,7 @@ pub fn process_python_package(
         Err(e) => {
             let spec_path = package_dir.join(format!("python-{}.spec", srcname));
             let spec_content = render_skeleton_spec(&srcname, &resolved_version, package_name, &e);
-            fs::write(&spec_path, spec_content).with_context(|| {
-                format!("failed to write generated spec: {}", spec_path.display())
-            })?;
+            write_file_ensuring_dir(&spec_path, spec_content.as_bytes())?;
             println!(
                 "[WARN] No source archive available for {}@{}. Generated skeleton spec: {}",
                 package_name,
@@ -158,8 +156,7 @@ pub fn process_python_package(
         &release_file.sha256,
         &meta,
     );
-    fs::write(&spec_path, spec_content)
-        .with_context(|| format!("failed to write generated spec: {}", spec_path.display()))?;
+    write_file_ensuring_dir(&spec_path, spec_content.as_bytes())?;
 
     println!("Generated spec file: {}", spec_path.display());
     Ok(())
@@ -1063,10 +1060,7 @@ fn filename_dist_name(filename: &str, version: &str) -> Option<String> {
 }
 
 fn normalize_srcname(name: &str) -> String {
-    name.trim()
-        .to_lowercase()
-        .replace('_', "-")
-        .replace('.', "-")
+    name.trim().to_lowercase().replace(['_', '.'], "-")
 }
 
 fn non_empty(s: &str) -> Option<&str> {

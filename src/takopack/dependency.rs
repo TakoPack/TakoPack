@@ -4,7 +4,6 @@ use itertools::Itertools;
 use std::cmp;
 use std::fmt;
 
-use crate::config::testing_ignore_debpolv;
 use crate::errors::*;
 use crate::takopack::{self, control::base_deb_name, Package};
 
@@ -201,7 +200,7 @@ impl VRange {
 fn coerce_unacceptable_predicate<'a>(
     dep: &Dependency,
     p: &'a semver::Comparator,
-    allow_prerelease_deps: bool,
+    _allow_prerelease_deps: bool,
 ) -> Result<&'a semver::Op> {
     let mmp = &V::new(p)?;
 
@@ -315,10 +314,11 @@ fn generate_version_constraints(
             vr.constrain_ge(mmp);
         }
 
-        (_, _) => {
-            // https://github.com/dtolnay/semver/issues/262
-            panic!("Op is non-exhaustive for some reason");
-        }
+        (_, _) => takopack_bail!(
+            "Unhandled dependency version predicate for {}: {:?}",
+            dep.package_name(),
+            p
+        ),
     }
 
     Ok(())

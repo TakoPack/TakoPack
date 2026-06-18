@@ -18,8 +18,8 @@ pub struct RecursivePackageArgs {
     /// TOML file providing package-specific options.
     #[arg(long)]
     pub config: Option<PathBuf>,
-    /// Base output directory for all packages (timestamp as default).
-    #[arg(short = 'o', long)]
+    /// Output root directory. Each package is generated under this root.
+    #[arg(short = 'o', long, value_name = "OUT_ROOT")]
     pub output: Option<PathBuf>,
 }
 
@@ -30,6 +30,9 @@ pub struct FailedPackage {
     pub version: String,
     pub error: String,
 }
+
+type DependencySpec = (String, Option<String>);
+type PackagedCrate = (PathBuf, String, Vec<DependencySpec>);
 
 /// State for recursive package processing
 pub struct RecursivePackager {
@@ -231,8 +234,7 @@ impl RecursivePackager {
 
         // Map dependencies to their real names before processing
         // (dependencies already contain the real crate names from Cargo.toml)
-        let deps_with_real_names: Vec<(String, Option<String>)> =
-            dependencies.into_iter().collect();
+        let deps_with_real_names: Vec<DependencySpec> = dependencies.into_iter().collect();
 
         // Recursively process each dependency
         for (real_dep_name, dep_version) in deps_with_real_names {
@@ -252,33 +254,12 @@ impl RecursivePackager {
         crate_name: &str,
         version: Option<&str>,
         config_path: Option<PathBuf>,
-    ) -> Result<(PathBuf, String, Vec<(String, Option<String>)>)> {
-        // Convert underscores to dashes for package naming
-        let pkg_name = format!("rust-{}", crate_name.replace('_', "-"));
-
-        // Create final output directory for this crate
-        let final_pkg_dir = self.base_dir.join(&pkg_name);
-
-        // If directory exists, remove it first to avoid conflicts
-        if final_pkg_dir.exists() {
-            if final_pkg_dir.is_dir() {
-                fs::remove_dir_all(&final_pkg_dir).with_context(|| {
-                    format!("Failed to remove existing directory: {:?}", final_pkg_dir)
-                })?;
-            } else {
-                // It's a file, remove it
-                fs::remove_file(&final_pkg_dir).with_context(|| {
-                    format!("Failed to remove existing file: {:?}", final_pkg_dir)
-                })?;
-            }
-        }
-
-        fs::create_dir_all(&final_pkg_dir)
-            .with_context(|| format!("Failed to create package directory: {:?}", final_pkg_dir))?;
+    ) -> Result<PackagedCrate> {
+        let pkg_base = format!("rust-{}", crate_name.replace('_', "-"));
 
         // Use a temporary directory for extraction and processing
         let temp_dir = tempfile::Builder::new()
-            .prefix(&format!("takopack-{}-", pkg_name))
+            .prefix(&format!("takopack-{}-", pkg_base))
             .tempdir()
             .context("Failed to create temporary directory")?;
 
@@ -305,6 +286,27 @@ impl RecursivePackager {
         // Execute packaging
         let mut process = PackageProcess::init(init_args)
             .with_context(|| format!("Failed to init package process for {}", crate_name))?;
+        let output_names = crate::util::rust_crate_output_names(
+            process.crate_info.crate_name(),
+            process.crate_info.version(),
+        );
+
+        // Create final output directory for this crate.
+        let final_pkg_dir = self.base_dir.join(&output_names.directory);
+        if final_pkg_dir.exists() {
+            if final_pkg_dir.is_dir() {
+                fs::remove_dir_all(&final_pkg_dir).with_context(|| {
+                    format!("Failed to remove existing directory: {:?}", final_pkg_dir)
+                })?;
+            } else {
+                fs::remove_file(&final_pkg_dir).with_context(|| {
+                    format!("Failed to remove existing file: {:?}", final_pkg_dir)
+                })?;
+            }
+        }
+        fs::create_dir_all(&final_pkg_dir)
+            .with_context(|| format!("Failed to create package directory: {:?}", final_pkg_dir))?;
+
         process
             .extract(extract_args)
             .with_context(|| format!("Failed to extract package for {}", crate_name))?;
@@ -327,9 +329,8 @@ impl RecursivePackager {
             self.extract_dependencies_from_crate_info(&process.crate_info, crate_name)?;
 
         // Find and copy the generated spec file to final location
-        let spec_name = format!("{}.spec", pkg_name);
-        let temp_spec_path = temp_pkg_dir.join("takopack").join(&spec_name);
-        let final_spec_path = final_pkg_dir.join(&spec_name);
+        let temp_spec_path = temp_pkg_dir.join("takopack").join(&output_names.spec_file);
+        let final_spec_path = final_pkg_dir.join(&output_names.spec_file);
 
         if temp_spec_path.exists() {
             fs::copy(&temp_spec_path, &final_spec_path).with_context(|| {
@@ -338,6 +339,7 @@ impl RecursivePackager {
                     temp_spec_path, final_spec_path
                 )
             })?;
+            crate::util::copy_normalized_cargo_toml_to_dir(&temp_pkg_dir, &final_pkg_dir)?;
         } else {
             anyhow::bail!("Spec file not found: {:?}", temp_spec_path);
         }
@@ -353,7 +355,7 @@ impl RecursivePackager {
         &self,
         crate_info: &crate::crates::CrateInfo,
         current_crate: &str,
-    ) -> Result<Vec<(String, Option<String>)>> {
+    ) -> Result<Vec<DependencySpec>> {
         use cargo::core::dependency::DepKind;
 
         let mut dependencies = Vec::new();

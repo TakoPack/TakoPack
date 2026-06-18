@@ -5,8 +5,9 @@ use takopack::cli::{CargoOpt, Cli, Opt, PyOpt};
 use takopack::crates::invalidate_crates_io_cache;
 use takopack::errors::Result;
 use takopack::package::*;
+use takopack::range_audit::{self, RangeCapabilityPolicy};
 use takopack::recursive_package::RecursivePackager;
-use takopack::spec_from_toml::{generate_spec_from_toml, parse_dependencies_from_toml};
+use takopack::spec_from_toml::parse_dependencies_from_toml;
 
 #[test]
 fn verify_app() {
@@ -14,20 +15,20 @@ fn verify_app() {
     Cli::command().debug_assert()
 }
 
-fn real_main() -> Result<()> {
+fn real_main() -> Result<i32> {
     let m = Cli::parse();
     use Opt::*;
     match m.command {
         Cargo(cargo_opt) => {
             match cargo_opt {
-                CargoOpt::Update => invalidate_crates_io_cache(),
+                CargoOpt::Update => invalidate_crates_io_cache().map(|_| 0),
                 CargoOpt::Package {
                     init,
-                    extract,
+                    mut extract,
                     finish,
+                    range_capability_policy,
                 } => {
                     use std::fs;
-                    use std::path::PathBuf;
 
                     log::info!("preparing crate info");
                     let mut process = PackageProcess::init(init)?;
@@ -36,16 +37,24 @@ fn real_main() -> Result<()> {
                     let crate_name = process.crate_info().crate_name();
                     let version = process.crate_info().version();
 
-                    // Calculate compatibility version following Rust semver rules
-                    let compat_version = takopack::util::calculate_compat_version(version);
-
-                    let output_dirname =
-                        format!("rust-{}-{}", crate_name.replace('_', "-"), compat_version);
-                    let spec_filename = format!("rust-{}.spec", crate_name.replace('_', "-"));
-                    let final_output = PathBuf::from(&output_dirname);
+                    let output_names = takopack::util::rust_crate_output_names(crate_name, version);
+                    let final_output = takopack::util::package_final_output_dir(
+                        extract.directory.as_deref(),
+                        &output_names,
+                    )?;
+                    extract.directory = Some(final_output.clone());
 
                     process.extract(extract)?;
                     process.apply_overrides()?;
+                    if range_capability_policy != RangeCapabilityPolicy::Allow {
+                        let warnings = range_audit::audit_cargo_dependencies(
+                            process.crate_info().dependencies(),
+                            Some(&output_names.directory),
+                        );
+                        if range_audit::emit_warnings(&warnings, range_capability_policy) {
+                            anyhow::bail!("range capability audit failed (policy: error)");
+                        }
+                    }
                     process.prepare_orig_tarball()?;
                     process.prepare_takopack_folder(finish)?;
 
@@ -55,14 +64,18 @@ fn real_main() -> Result<()> {
                     log::debug!("output_dirname: {}", final_output.display());
 
                     let takopack_dir = output_path.join("takopack");
-                    let source_spec = takopack_dir.join(&spec_filename);
+                    let source_spec = takopack_dir.join(&output_names.spec_file);
 
-                    // Create final output directory and copy only the spec file
+                    // Create final output directory and copy the spec plus normalized Cargo.toml.
                     fs::create_dir_all(&final_output)?;
-                    let final_spec = final_output.join(&spec_filename);
+                    let final_spec = final_output.join(&output_names.spec_file);
 
                     if source_spec.exists() {
                         fs::copy(&source_spec, &final_spec)?;
+                        let final_cargo_toml = takopack::util::copy_normalized_cargo_toml_to_dir(
+                            output_path,
+                            &final_output,
+                        )?;
                         log::info!("Spec file saved to: {}", final_spec.display());
                         println!("Spec file: {}", final_spec.display());
 
@@ -77,7 +90,7 @@ fn real_main() -> Result<()> {
                             for entry in fs::read_dir(output_path)? {
                                 let entry = entry?;
                                 let path = entry.path();
-                                if path != final_spec {
+                                if path != final_spec && path != final_cargo_toml {
                                     if path.is_dir() {
                                         fs::remove_dir_all(&path)?;
                                     } else {
@@ -96,7 +109,7 @@ fn real_main() -> Result<()> {
                         eprintln!("ERROR: Spec file not found!");
                     };
 
-                    Ok(())
+                    Ok(0)
                 }
                 CargoOpt::Vendor { args } => {
                     log::info!("starting vendor operation (recursive packaging)");
@@ -107,50 +120,32 @@ fn real_main() -> Result<()> {
                         args.config,
                     )?;
                     packager.print_summary();
-                    Ok(())
-                }
-                CargoOpt::FromToml { toml_path, output } => {
-                    log::info!("generating spec file from Cargo.toml");
-                    generate_spec_from_toml(&toml_path, output)?;
-                    Ok(())
+                    Ok(0)
                 }
                 CargoOpt::ParseToml { toml_path, output } => {
                     log::info!("parsing dependencies from Cargo.toml");
                     parse_dependencies_from_toml(&toml_path, output)?;
-                    Ok(())
+                    Ok(0)
                 }
                 CargoOpt::Batch { file, output } => {
                     log::info!("starting batch operation from file: {:?}", file);
                     takopack::batch_package::process_batch_file(&file, output)?;
-                    Ok(())
+                    Ok(0)
                 }
                 CargoOpt::LocalPackage {
                     path,
                     output,
                     finish,
+                    range_capability_policy,
                 } => {
                     log::info!("packaging from local directory: {:?}", path);
-                    takopack::local_package::process_local_package(&path, output, finish)?;
-                    Ok(())
-                }
-                CargoOpt::Track {
-                    crate_name,
-                    version,
-                    from_file,
-                    output,
-                    database,
-                    action_file,
-                } => {
-                    log::info!("tracking dependencies");
-                    takopack::track_command::execute_track(
-                        crate_name,
-                        version,
-                        from_file,
+                    takopack::local_package::process_local_package(
+                        &path,
                         output,
-                        database,
-                        action_file,
+                        finish,
+                        range_capability_policy,
                     )?;
-                    Ok(())
+                    Ok(0)
                 }
             }
         }
@@ -166,7 +161,7 @@ fn real_main() -> Result<()> {
                     version.as_deref(),
                     output,
                 )?;
-                Ok(())
+                Ok(0)
             }
         },
     }
@@ -174,8 +169,11 @@ fn real_main() -> Result<()> {
 
 fn main() {
     env_logger::init();
-    if let Err(e) = real_main() {
-        eprintln!("{}", Red.bold().paint(format!("takopack failed: {:?}", e)));
-        std::process::exit(1);
+    match real_main() {
+        Ok(code) => std::process::exit(code),
+        Err(e) => {
+            eprintln!("{}", Red.bold().paint(format!("takopack failed: {:?}", e)));
+            std::process::exit(1);
+        }
     }
 }

@@ -9,7 +9,7 @@ license = "MIT/Apache-2.0"
 repository = "https://github.com/TakoPack/TakoPack"
 description = "A modified fork of debcargo, used to generate spec files."
 edition = "2021"
-rust-version = "1.58"
+rust-version = "1.70"
 
 [features]
 default = ["back_db"]

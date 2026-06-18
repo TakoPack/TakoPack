@@ -39,9 +39,9 @@ pub struct PackageInitArgs {
 
 #[derive(Debug, Clone, Parser)]
 pub struct PackageExtractArgs {
-    /// Output directory for the package. The orig tarball is named according
-    /// to takopack conventions in the parent directory of this directory.
-    #[arg(long)]
+    /// Final output package directory. Files are written directly into this
+    /// directory; the orig tarball is written in its parent directory.
+    #[arg(long, value_name = "OUT_DIR")]
     pub directory: Option<PathBuf>,
 }
 

@@ -1,7 +1,5 @@
 use anyhow::{Context, Result};
-use cargo::core::{Resolve, Workspace};
-use cargo::ops;
-use cargo::util::GlobalContext;
+use cargo::core::Resolve;
 use semver::Version;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -209,7 +207,7 @@ fn build_dependency_graph_from_toml(lockfile: &toml::Value) -> Result<Dependency
 
         name_to_versions
             .entry(name.to_string())
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(version);
     }
 

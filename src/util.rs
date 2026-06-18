@@ -1,4 +1,3 @@
-use core::panic;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsStr;
@@ -21,6 +20,12 @@ use semver::Version;
 use walkdir::WalkDir;
 pub const HINT_SUFFIX: &str = ".takopack.hint";
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RustCrateOutputNames {
+    pub directory: String,
+    pub spec_file: String,
+}
+
 fn cargo_back_dir() -> Result<PathBuf, anyhow::Error> {
     use anyhow::Context;
 
@@ -33,11 +38,11 @@ fn cargo_back_dir() -> Result<PathBuf, anyhow::Error> {
     Ok(data_home.join("takopack").join("cargo_back"))
 }
 
-/// Calculate compatibility version following Rust semver rules
+/// Calculate compatibility branch following openRuyi Rust crate naming policy.
 /// - Prerelease versions (e.g., 0.26.0-beta.1) -> full version (0.26.0-beta.1)
-/// - BuildMetadata versions (e.g., 0.7.5+spec-1.1.0) -> full version (0.7.0)
+/// - Build metadata is ignored by semver compatibility and does not affect the branch
 /// - 0.x.y -> 0.x (0.x series, minor version compatibility)
-/// - 1.x.y+ -> 1.0 (1.0+ series, major version compatibility)
+/// - 1.x.y+ -> 1 (major version compatibility)
 /// - 0.0.x+ -> 0.0.x (0.0.x series, patch version compatibility)
 pub fn calculate_compat_version(version: &Version) -> String {
     // For prerelease versions, use the full version including prerelease tag
@@ -46,22 +51,78 @@ pub fn calculate_compat_version(version: &Version) -> String {
             "{}.{}.{}-{}",
             version.major, version.minor, version.patch, version.pre
         )
-    } else if false {
-        // } else if !version.build.is_empty() {
-        // TODO: In crates.io, build metadata is ignored for version precedence.
-        // There can't be 0.9.11+spec-1.1.0 and 0.9.11+spec-1.2.0 at crates.io.
-        // So we just use the full version. major.minor.patch without build metadata.
-        // format!("{}.{}.{}", version.major, version.minor, version.patch)
-
-        // format!("{}.{}.{}+{}", version.major, version.minor, version.patch, version.build)
-        panic!("nerver to be here.")
-    } else if version.major != 0 {
-        format!("{}.0", version.major)
-    } else if version.minor != 0 {
+    } else if version.major > 0 {
+        version.major.to_string()
+    } else if version.minor > 0 {
         format!("0.{}", version.minor)
     } else {
         format!("0.0.{}", version.patch)
     }
+}
+
+pub fn rust_crate_output_names(crate_name: &str, version: &Version) -> RustCrateOutputNames {
+    let crate_name = crate_name.replace('_', "-");
+    let compat_version = calculate_compat_version(version);
+    let directory = format!("rust-{}-{}", crate_name, compat_version);
+    let spec_file = format!("{}.spec", directory);
+
+    RustCrateOutputNames {
+        directory,
+        spec_file,
+    }
+}
+
+pub fn write_file_ensuring_dir(path: &Path, contents: impl AsRef<[u8]>) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create directory for {:?}", path))?;
+    }
+
+    fs::write(path, contents).with_context(|| format!("Failed to write {:?}", path))
+}
+
+pub fn resolve_output_dir(path: &Path) -> Result<PathBuf> {
+    let cwd = std::env::current_dir().context("Failed to resolve current directory")?;
+    Ok(resolve_output_dir_with_base(path, &cwd))
+}
+
+pub fn resolve_output_dir_with_base(path: &Path, cwd: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    }
+}
+
+pub fn package_final_output_dir(
+    explicit_dir: Option<&Path>,
+    output_names: &RustCrateOutputNames,
+) -> Result<PathBuf> {
+    let default_dir;
+    let requested = match explicit_dir {
+        Some(path) => path,
+        None => {
+            default_dir = PathBuf::from(&output_names.directory);
+            &default_dir
+        }
+    };
+    resolve_output_dir(requested)
+}
+
+pub fn package_final_output_dir_with_base(
+    explicit_dir: Option<&Path>,
+    output_names: &RustCrateOutputNames,
+    cwd: &Path,
+) -> PathBuf {
+    let default_dir;
+    let requested = match explicit_dir {
+        Some(path) => path,
+        None => {
+            default_dir = PathBuf::from(&output_names.directory);
+            &default_dir
+        }
+    };
+    resolve_output_dir_with_base(requested, cwd)
 }
 
 #[cfg(unix)]
@@ -181,6 +242,8 @@ where
     show_vec_with(it, std::string::ToString::to_string)
 }
 
+type TransitiveValueResult<K, V> = Result<Option<V>, (K, Vec<(K, V)>)>;
+
 pub fn expect_success(cmd: &mut Command, err: &str) -> Result<(), anyhow::Error> {
     match cmd.status() {
         Ok(status) if status.success() => Ok(()),
@@ -209,7 +272,6 @@ where
 
 /// Get a value that might be set at a key or any of its ancestor keys,
 /// whichever is closest. Error if there are conflicting definitions.
-#[allow(clippy::type_complexity)]
 pub(crate) fn get_transitive_val<
     'a,
     P: Fn(K) -> Option<&'a Vec<K>>,
@@ -220,7 +282,7 @@ pub(crate) fn get_transitive_val<
     getparents: &'a P,
     f: &F,
     key: K,
-) -> Result<Option<V>, (K, Vec<(K, V)>)> {
+) -> TransitiveValueResult<K, V> {
     let mut visited = std::collections::BTreeSet::new();
     get_transitive_val_impl(getparents, f, key, &mut visited)
 }
@@ -236,7 +298,7 @@ fn get_transitive_val_impl<
     f: &F,
     key: K,
     visited: &mut std::collections::BTreeSet<K>,
-) -> Result<Option<V>, (K, Vec<(K, V)>)> {
+) -> TransitiveValueResult<K, V> {
     // Check for cycles
     if visited.contains(&key) {
         // Cycle detected, return None to break the recursion
@@ -391,6 +453,69 @@ pub fn backup_cargo_toml(
     Ok(())
 }
 
+pub fn copy_normalized_cargo_toml_to_dir(source_dir: &Path, target_dir: &Path) -> Result<PathBuf> {
+    let cargo_toml_orig = source_dir.join("Cargo.toml.orig");
+    let cargo_toml = source_dir.join("Cargo.toml");
+    let source = if cargo_toml.exists() {
+        cargo_toml
+    } else {
+        cargo_toml_orig
+    };
+
+    if !source.exists() {
+        bail!("Cargo.toml not found under {}", source_dir.display());
+    }
+
+    fs::create_dir_all(target_dir)
+        .with_context(|| format!("Failed to create output directory: {:?}", target_dir))?;
+    let target = target_dir.join("Cargo.toml");
+
+    if target.exists() {
+        if let (Ok(source_path), Ok(target_path)) = (source.canonicalize(), target.canonicalize()) {
+            if source_path == target_path {
+                return Ok(target);
+            }
+        }
+    }
+
+    fs::copy(&source, &target)
+        .with_context(|| format!("Failed to copy Cargo.toml to {:?}", target))?;
+
+    let copied = fs::read_to_string(&target)
+        .with_context(|| format!("Failed to read copied Cargo.toml at {:?}", target))?;
+    if cargo_toml_has_workspace_inheritance(&copied) {
+        takopack_warn!(
+            "warning: copied Cargo.toml at {} contains workspace inheritance; provider manifests should be independently parseable",
+            target.display()
+        );
+    }
+
+    Ok(target)
+}
+
+pub fn cargo_toml_has_workspace_inheritance(contents: &str) -> bool {
+    contents.lines().any(|line| {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            return false;
+        }
+
+        if matches!(
+            line,
+            "[workspace]" | "[workspace.package]" | "[workspace.dependencies]"
+        ) {
+            return true;
+        }
+
+        if line.contains(".workspace") {
+            return true;
+        }
+
+        let compact: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+        compact.contains("workspace=true")
+    })
+}
+
 /// Backup Cargo.lock to ${XDG_DATA_HOME:-$HOME/.local/share}/takopack/cargo_back directory
 /// File will be named as: crate_name-version.lock
 /// If subdir is provided, file will be saved in the matching subdirectory
@@ -421,7 +546,7 @@ pub fn backup_cargo_lock(
         log::info!("Backed up Cargo.lock to: {:?}", backup_path);
     } else {
         log::warn!("Cargo.lock not found at: {:?}", cargo_lock_path);
-        panic!("Cargo.lock backup failed!");
+        bail!("Cargo.lock not found at {:?}", cargo_lock_path);
     }
 
     Ok(backup_path)
@@ -494,22 +619,18 @@ pub fn process_single_crate(
         // Copy spec file to base_dir (use absolute path)
         let output_path = process.output_dir.as_ref().unwrap();
         let takopack_dir = output_path.join("takopack");
-        let spec_filename = format!("rust-{}.spec", crate_name.replace('_', "-"));
-        let source_spec = takopack_dir.join(&spec_filename);
-
-        // Calculate compatibility version for target directory name
-        let version_obj = process.crate_info().version();
-        let compat_version = crate::util::calculate_compat_version(version_obj);
-        let target_dirname = format!("rust-{}-{}", crate_name.replace('_', "-"), compat_version);
+        let output_names = rust_crate_output_names(crate_name, process.crate_info().version());
+        let source_spec = takopack_dir.join(&output_names.spec_file);
 
         // Create target directory in base_dir_abs (not work_dir)
-        let target_dir = base_dir_abs.join(&target_dirname);
+        let target_dir = base_dir_abs.join(&output_names.directory);
         fs::create_dir_all(&target_dir)?;
-        let final_spec = target_dir.join(&spec_filename);
+        let final_spec = target_dir.join(&output_names.spec_file);
 
         // Copy spec file to target directory
         if source_spec.exists() {
             fs::copy(&source_spec, &final_spec)?;
+            copy_normalized_cargo_toml_to_dir(output_path, &target_dir)?;
             log::debug!("Copied spec file to: {:?}", final_spec);
         } else {
             return Err(anyhow::anyhow!(
@@ -532,4 +653,156 @@ pub fn process_single_crate(
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        calculate_compat_version, cargo_toml_has_workspace_inheritance,
+        copy_normalized_cargo_toml_to_dir, package_final_output_dir_with_base,
+        resolve_output_dir_with_base, rust_crate_output_names,
+    };
+    use semver::Version;
+    use std::fs;
+    use std::path::Path;
+
+    #[test]
+    fn calculate_compat_version_uses_openruyi_policy() {
+        for (version, expected) in [
+            ("1.0.228", "1"),
+            ("1.2.3", "1"),
+            ("2.0.0", "2"),
+            ("3.18.0", "3"),
+            ("4.6.1", "4"),
+            ("0.22.1", "0.22"),
+            ("0.9.3", "0.9"),
+            ("0.0.7", "0.0.7"),
+        ] {
+            assert_eq!(
+                calculate_compat_version(&Version::parse(version).unwrap()),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn rust_crate_output_names_follow_compat_directory() {
+        assert_eq!(
+            rust_crate_output_names("clap", &Version::parse("4.6.1").unwrap()),
+            super::RustCrateOutputNames {
+                directory: "rust-clap-4".to_string(),
+                spec_file: "rust-clap-4.spec".to_string(),
+            }
+        );
+        assert_eq!(
+            rust_crate_output_names("serde_core", &Version::parse("1.0.228").unwrap()).spec_file,
+            "rust-serde-core-1.spec"
+        );
+        assert_eq!(
+            rust_crate_output_names("base64", &Version::parse("0.22.1").unwrap()).spec_file,
+            "rust-base64-0.22.spec"
+        );
+    }
+
+    #[test]
+    fn copy_normalized_cargo_toml_prefers_cargo_toml_over_orig() {
+        let source = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+
+        fs::write(
+            source.path().join("Cargo.toml"),
+            "[package]\nname = \"normalized\"\nversion = \"1.0.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            source.path().join("Cargo.toml.orig"),
+            "[package]\nname = \"raw\"\nversion = \"1.0.0\"\nworkspace = true\n",
+        )
+        .unwrap();
+
+        copy_normalized_cargo_toml_to_dir(source.path(), out.path()).unwrap();
+
+        let copied = fs::read_to_string(out.path().join("Cargo.toml")).unwrap();
+        assert!(copied.contains("name = \"normalized\""));
+        assert!(!copied.contains("workspace = true"));
+    }
+
+    #[test]
+    fn copy_normalized_cargo_toml_falls_back_to_orig_only_when_needed() {
+        let source = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+
+        fs::write(
+            source.path().join("Cargo.toml.orig"),
+            "[package]\nname = \"raw\"\nversion = \"1.0.0\"\nworkspace = true\n",
+        )
+        .unwrap();
+
+        copy_normalized_cargo_toml_to_dir(source.path(), out.path()).unwrap();
+
+        let copied = fs::read_to_string(out.path().join("Cargo.toml")).unwrap();
+        assert!(copied.contains("name = \"raw\""));
+        assert!(copied.contains("workspace = true"));
+    }
+
+    #[test]
+    fn cargo_toml_workspace_inheritance_detection_is_conservative() {
+        assert!(cargo_toml_has_workspace_inheritance(
+            "[package]\nname = \"raw\"\nworkspace = true\n"
+        ));
+        assert!(cargo_toml_has_workspace_inheritance(
+            "[package]\nauthors.workspace = true\n"
+        ));
+        assert!(cargo_toml_has_workspace_inheritance(
+            "[workspace.dependencies]\nserde = \"1\"\n"
+        ));
+        assert!(!cargo_toml_has_workspace_inheritance(
+            "[package]\nname = \"normalized\"\nversion = \"1.0.0\"\n"
+        ));
+    }
+
+    #[test]
+    fn explicit_absolute_output_dir_remains_absolute() {
+        let output_names = rust_crate_output_names("libc", &Version::parse("0.2.184").unwrap());
+        let out = Path::new("/tmp/takopack-test/rust-libc-0.2");
+
+        assert_eq!(
+            package_final_output_dir_with_base(
+                Some(out),
+                &output_names,
+                Path::new("/root/git/TakoPack")
+            ),
+            out
+        );
+    }
+
+    #[test]
+    fn explicit_relative_output_dir_resolves_under_current_dir() {
+        assert_eq!(
+            resolve_output_dir_with_base(
+                Path::new("target/tmp/rust-libc-0.2"),
+                Path::new("/root/git/TakoPack")
+            ),
+            Path::new("/root/git/TakoPack/target/tmp/rust-libc-0.2")
+        );
+    }
+
+    #[test]
+    fn explicit_package_dir_is_not_replaced_by_generated_basename() {
+        let output_names = rust_crate_output_names("libc", &Version::parse("0.2.184").unwrap());
+
+        assert_eq!(
+            package_final_output_dir_with_base(
+                Some(Path::new("custom/final-libc-dir")),
+                &output_names,
+                Path::new("/repo")
+            ),
+            Path::new("/repo/custom/final-libc-dir")
+        );
+
+        assert_eq!(
+            package_final_output_dir_with_base(None, &output_names, Path::new("/repo")),
+            Path::new("/repo/rust-libc-0.2")
+        );
+    }
 }

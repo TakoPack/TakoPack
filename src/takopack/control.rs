@@ -1,17 +1,16 @@
-use core::panic;
 use std::collections::HashMap;
-#[cfg(not(test))]
-use std::env::{self, VarError};
 use std::fmt::{self, Write};
 
-#[cfg(not(test))]
-use anyhow::{format_err, Error};
-use cargo::core::Dependency;
+use cargo::{core::Dependency, util::OptVersionReq};
 use semver::Version;
 use textwrap::fill;
 
 use crate::config::{self, Config, PackageKey};
+use crate::crates::dependency_is_runtime_candidate;
 use crate::errors::*;
+use crate::takopack::spec::{
+    self, CrateCapability, CrateRequirement, RequirementVersion, SpecPackage, SpecSource,
+};
 
 #[derive(Default, Debug)]
 pub struct BuildDeps {
@@ -25,9 +24,6 @@ pub struct Source {
     version: String,
     full_version: String, // Full version including build metadata (e.g., "0.7.5+spec-1.1.0")
     section: String,
-    priority: String,
-    maintainer: String,
-    uploaders: Vec<String>,
     standards: String,
     build_deps: BuildDeps,
     vcs_git: String,
@@ -35,8 +31,6 @@ pub struct Source {
     homepage: String,
     crate_name: String,
     license: String,
-    requires_root: Option<String>,
-    download_url: String,
     sha256: Option<String>, // SHA256 hash of the downloaded crate file
 }
 
@@ -47,9 +41,11 @@ pub struct Package {
     section: Option<String>,
     depends: Vec<String>,
     crate_deps: Vec<CrateDep>, // Structured dependencies for crate() format
+    crate_requires: Vec<CrateRequirement>, // Structured external crate requirements from Cargo.toml
     recommends: Vec<String>,
     suggests: Vec<String>,
     provides: Vec<String>,
+    feature_provides: Vec<String>, // Structured Cargo feature aliases provided by this package
     breaks: Vec<String>,
     replaces: Vec<String>,
     conflicts: Vec<String>,
@@ -95,13 +91,34 @@ impl CrateDep {
     }
 
     pub fn to_crate_format(&self) -> String {
+        spec::render_crate_requirement(&self.to_crate_requirement())
+    }
+
+    fn to_crate_requirement(&self) -> CrateRequirement {
+        let crate_name = self.crate_name_with_compat();
+        let requirement = if crate_name == "%{pkgname}" {
+            RequirementVersion::Exact("%{version}".to_string())
+        } else if let Some(version) = self.cleaned_version_requirement() {
+            RequirementVersion::Range(version)
+        } else {
+            RequirementVersion::None
+        };
+
+        CrateRequirement {
+            crate_name,
+            feature: self.feature.clone(),
+            requirement,
+        }
+    }
+
+    fn crate_name_with_compat(&self) -> String {
         let crate_base = self.crate_name.replace('_', "-");
         // Extract compatibility version from version constraint
-        // E.g., ">= 0.6.2" -> "0.6", ">= 2.2.1" -> "2.0", ">= 1.13" -> "1.0"
+        // E.g., ">= 0.6.2" -> "0.6", ">= 2.2.1" -> "2", ">= 1.13" -> "1"
         // For prerelease: ">= 0.26.0-beta.1" -> "0.26.0-beta.1" (full version with - separator)
         // log::debug!("before version_num: {} {:?}", crate_base, &self.version);
 
-        let crate_with_compat = if let Some(version_str) = &self.version {
+        if let Some(version_str) = &self.version {
             // the option deps won't appear in here.
             // println!("Version crate_name string: {} {}", self.crate_name, version_str);
             // Clean version string first: remove wildcards and other invalid RPM chars
@@ -139,42 +156,36 @@ impl CrateDep {
                     let compat_version = crate::util::calculate_compat_version(&ver);
                     format!("{}-{}", crate_base, compat_version)
                 } else {
-                    // bitflags-2.0 the bytemuck is 1.4,so parse error.
-                    // so we add ".0" on the other branch. this code must't be reached.
-                    panic!(
-                        "Failed to parse version '{}' for crate '{}'",
-                        version_num, crate_base
+                    // Legacy fallback only: structured Cargo requirements use
+                    // cargo_dep_crate_name instead. If this old path sees a
+                    // shape it cannot parse, keep an unversioned capability
+                    // rather than aborting spec rendering.
+                    log::warn!(
+                        "failed to parse legacy crate dependency version '{}' for crate '{}'",
+                        version_num,
+                        crate_base
                     );
-                    // format!("{}-{}", crate_base, version_without_build)
+                    crate_base
                 }
             }
         } else {
             crate_base
-        };
-        let crate_part = if let Some(feature) = &self.feature {
-            let feature_base = feature.replace('_', "-").to_lowercase();
-            // imagequant-sys-4.0.3 the feature starts with _
-            let feature_base_trimmed = feature_base.trim_start_matches('-');
-            format!("crate({}/{})", crate_with_compat, feature_base_trimmed)
-        } else {
-            format!("crate({})", crate_with_compat)
-        };
+        }
+    }
 
-        if let Some(version) = &self.version {
+    fn cleaned_version_requirement(&self) -> Option<String> {
+        self.version.as_ref().map(|version| {
             // Clean version string for output: remove wildcards, build metadata, and other invalid RPM chars
             // "0.4.*" -> "0.4.0", ">= 0.4.*" -> ">= 0.4.0"
             // "0.7.5+spec-1.1.0" -> "0.7.5"
-            let cleaned_version = version
+            version
                 .replace(".*", ".0")
                 .replace('*', "0")
                 .split('+')
                 .next()
                 .unwrap_or(version)
-                .to_string();
-            format!("{} {}", crate_part, cleaned_version)
-        } else {
-            crate_part
-        }
+                .to_string()
+        })
     }
 }
 
@@ -200,16 +211,20 @@ impl fmt::Display for Source {
         // Package name uses hyphens instead of underscores
         let pkg_name = self.crate_name.replace('_', "-");
 
-        // Check if full_version contains build metadata
-        let has_build_metadata = self.full_version.contains('+');
-
-        // Calculate compatibility version following Rust semver rules
-        // 0.x.y -> 0.x, 1.x.y -> 1.0
-        // BUT: if version has build metadata, use full version instead
-        let compat_version = if let Ok(ver) = Version::parse(&self.version) {
-            crate::util::calculate_compat_version(&ver)
+        let (pkgname, rpm_name) = if let Ok(ver) = Version::parse(&self.version) {
+            let output_names = crate::util::rust_crate_output_names(&self.crate_name, &ver);
+            let pkgname = output_names
+                .directory
+                .strip_prefix("rust-")
+                .unwrap_or(&output_names.directory)
+                .to_string();
+            (pkgname, output_names.directory)
         } else {
-            self.version.clone()
+            let compat_version = self.version.clone();
+            (
+                format!("{}-{}", pkg_name, compat_version),
+                format!("rust-{}-{}", pkg_name, compat_version),
+            )
         };
 
         // For RPM Version field, strip prerelease suffix (RPM doesn't allow '-' in Version)
@@ -225,59 +240,38 @@ impl fmt::Display for Source {
             self.version.clone()
         };
 
-        // Define macro with original crate name (may contain underscores)
-        writeln!(f, "%global crate_name {}", self.crate_name)?;
-        writeln!(f, "%global full_version {}", self.full_version)?;
-        writeln!(f, "%global pkgname {}-{}", pkg_name, compat_version)?;
-
-        writeln!(f)?;
-
-        writeln!(f, "Name:           rust-{}-{}", pkg_name, compat_version)?;
-        writeln!(f, "Version:        {}", rpm_version)?;
-        writeln!(f, "Release:        %autorelease")?;
-        writeln!(f, "Summary:        Rust crate \"{}\"", self.crate_name)?;
-        writeln!(
-            f,
-            "License:        {}",
-            if !self.license.is_empty() {
-                &self.license
+        let source = SpecSource {
+            crate_name: self.crate_name.clone(),
+            full_version: self.full_version.clone(),
+            pkgname,
+            rpm_name,
+            rpm_version,
+            summary: format!("Rust crate \"{}\"", self.crate_name),
+            license: if !self.license.is_empty() {
+                self.license.clone()
             } else {
-                "FIXME"
-            }
-        )?;
-        writeln!(
-            f,
-            "URL:            {}",
-            if !self.homepage.is_empty() {
-                &self.homepage
+                "FIXME".to_string()
+            },
+            url: if !self.homepage.is_empty() {
+                self.homepage.clone()
             } else {
-                "FIXME"
-            }
-        )?;
-        // url is already git repo.
-        // if !self.vcs_git.is_empty() {
-        //     writeln!(f, "VCS:            {}", self.vcs_git)?;
-        // } else {
-        //     writeln!(f, "# No git repo found.")?;
-        // }
-        if let Some(ref hash) = self.sha256 {
-            writeln!(f, "#!RemoteAsset:  sha256:{}", hash)?;
-        } else {
-            writeln!(f, "#!RemoteAsset:  sha256:")?;
-        }
-        // Use full version (including build metadata) in Source URL
-        // This is needed for crates like toml_datetime with versions like "0.7.5+spec-1.1.0"
-        writeln!(f, "Source:         https://static.crates.io/crates/%{{crate_name}}/%{{full_version}}/download#/%{{name}}-%{{version}}.tar.gz")?;
-        writeln!(f, "BuildArch:      noarch")?;
-        writeln!(f, "BuildSystem:    rustcrates")?;
-        writeln!(f, "")?;
-        writeln!(f, "BuildRequires:  rust-rpm-macros")?;
-        writeln!(f)?;
+                "FIXME".to_string()
+            },
+            // Use full version (including build metadata) in Source URL.
+            source_url: "https://static.crates.io/crates/%{crate_name}/%{full_version}/download#/%{name}-%{version}.tar.gz".to_string(),
+            sha256: self.sha256.clone(),
+            build_requires: vec!["rust-rpm-macros".to_string()],
+        };
+
+        spec::render_header_section(f, &source)?;
+        spec::render_source_requirements_section(f, &source)?;
         Ok(())
     }
 }
 
 fn clean_package_name(pkg_name: &str) -> String {
+    // Legacy fallback for Debian-style package names used in Obsoletes/Conflicts.
+    // New RPM crate capability generation should use structured Cargo feature data.
     // Convert old format to new format and remove version numbers
     // librust-proc-macro2-1+default-dev -> rust-proc-macro2-default
     // librust-heck-0.5+default-devel -> rust-heck-default
@@ -310,10 +304,10 @@ fn clean_package_name(pkg_name: &str) -> String {
                 return false;
             }
             // Check if it's a version number: starts with digit and only contains digits/dots
-            if part.chars().next().map_or(false, |c| c.is_ascii_digit()) {
-                if part.chars().all(|c| c.is_ascii_digit() || c == '.') {
-                    return false; // This is a version number, filter it out
-                }
+            if part.chars().next().is_some_and(|c| c.is_ascii_digit())
+                && part.chars().all(|c| c.is_ascii_digit() || c == '.')
+            {
+                return false; // This is a version number, filter it out
             }
             true
         })
@@ -322,142 +316,166 @@ fn clean_package_name(pkg_name: &str) -> String {
     cleaned_parts.join("-")
 }
 
-fn convert_to_crate_format(pkg_name: &str) -> String {
-    // Convert rust-{crate}-{feature} to crate({crate}/{feature})
-    // Convert rust-{crate} to crate({crate})
-    // Examples:
-    //   rust-serde-core-result -> crate(serde-core/result)
-    //   rust-serde -> crate(serde)
-    //   rust-serde-derive-default -> crate(serde-derive/default)
+fn crate_requirements_from_cargo_deps(
+    deps: &[Dependency],
+    current_crate_name: &str,
+) -> Vec<CrateRequirement> {
+    use cargo::core::dependency::DepKind;
 
-    let cleaned = clean_package_name(pkg_name);
+    let mut requirements = std::collections::BTreeMap::new();
+    let current_crate_base = spec::normalize_crate_name(current_crate_name);
 
-    // Remove rust- prefix
-    let without_prefix = if cleaned.starts_with("rust-") {
-        &cleaned[5..]
-    } else {
-        &cleaned
-    };
-
-    // Try to find the last component as feature
-    // We need to identify crate name vs feature name
-    // Pattern: {crate}-{feature} where feature is typically a single word
-    // Common features: default, alloc, std, core, etc.
-
-    let parts: Vec<&str> = without_prefix.split('-').collect();
-    if parts.len() > 1 {
-        // Check if last part looks like a feature name
-        // Common feature patterns: default, alloc, std, core, result, rc, etc.
-        let last = parts[parts.len() - 1];
-        let common_features = [
-            "default", "alloc", "std", "core", "result", "rc", "unstable", "derive", "nightly",
-            "serde", "tokio", "async", "sync",
-        ];
-
-        // If it's a common feature or all parts together don't form a known crate
-        // assume last part is a feature
-        if common_features.contains(&last) || parts.len() >= 3 {
-            let crate_parts = &parts[..parts.len() - 1];
-            let crate_name = crate_parts.join("-");
-            format!("crate({}/{})", crate_name, last)
-        } else {
-            // No feature, just crate name
-            format!("crate({})", without_prefix)
+    for dep in deps {
+        if !dependency_is_runtime_candidate(dep, false) {
+            continue;
         }
-    } else {
-        // Single part, just crate name
-        format!("crate({})", without_prefix)
-    }
-}
 
-fn extract_version_from_pkg_name(pkg_name: &str) -> Option<String> {
-    // Extract version from package names like:
-    // "rust-pyo3-build-config-0.26+default-dev" -> Some(">= 0.26.0")
-    // "rust-serde-1.0+default-dev" -> Some(">= 1.0.0")
+        let dep_crate_base = spec::normalize_crate_name(dep.package_name().as_str());
+        if dep_crate_base == current_crate_base {
+            continue;
+        }
 
-    let mut name = pkg_name.trim().to_string();
+        // Optional dependencies are already selected by the feature graph before
+        // they reach this helper, so the optional flag is intentionally not a filter.
+        let _is_optional = dep.is_optional();
+        let lower_bound = lower_bound_from_opt_version_req(dep.version_req());
+        let crate_name = cargo_dep_crate_name(dep.package_name().as_str(), lower_bound.as_deref());
+        let requirement = lower_bound
+            .map(|version| RequirementVersion::Range(format!(">= {}", version)))
+            // A wildcard dependency such as "*" has no meaningful lower bound.
+            // Keep the crate requirement unversioned rather than inventing one.
+            .unwrap_or(RequirementVersion::None);
 
-    // Remove -dev suffix
-    if name.ends_with("-dev") {
-        name = name[..name.len() - 4].to_string();
-    }
-
-    // Remove rust- or librust- prefix
-    if name.starts_with("librust-") {
-        name = name[8..].to_string();
-    } else if name.starts_with("rust-") {
-        name = name[5..].to_string();
-    }
-
-    // Remove feature part (after +)
-    if let Some(idx) = name.find('+') {
-        name = name[..idx].to_string();
-    }
-
-    // Now we have something like "pyo3-build-config-0.26" or "serde-1.0"
-    // Find the last part that looks like a version number
-    let parts: Vec<&str> = name.split('-').collect();
-    if let Some(last_part) = parts.last() {
-        // Check if it's a version number (starts with digit)
-        if last_part
-            .chars()
-            .next()
-            .map_or(false, |c| c.is_ascii_digit())
-        {
-            // Assume it's a major.minor version, add .0 for patch
-            if last_part.contains('.') {
-                return Some(format!(">= {}.0", last_part));
-            } else {
-                return Some(format!(">= {}.0.0", last_part));
+        let mut features = std::collections::BTreeSet::new();
+        if dep.kind() == DepKind::Build && !dep.is_optional() {
+            features.insert(None);
+            for feature in dep.features() {
+                features.insert(Some(feature.as_str().to_string()));
+            }
+        } else {
+            if dep.uses_default_features() {
+                features.insert(Some("default".to_string()));
+            }
+            for feature in dep.features() {
+                features.insert(Some(feature.as_str().to_string()));
+            }
+            if features.is_empty() {
+                features.insert(None);
             }
         }
+
+        for feature in features {
+            let requirement = CrateRequirement {
+                crate_name: crate_name.clone(),
+                feature,
+                requirement: requirement.clone(),
+            };
+            requirements.insert(crate_requirement_key(&requirement), requirement);
+        }
     }
 
-    None
+    requirements.into_values().collect()
 }
 
-/// Parse semver VersionReq string to extract lower bound version
-/// Examples:
-///   "^0.9" -> Some("0.9.0")
-///   ">=1.21, <2.0" -> Some("1.21.0")  
-///   "^0.2.62" -> Some("0.2.62")
-///   "*" -> None
-fn parse_version_req_to_lower_bound(version_req: &str) -> Option<String> {
-    let req_str = version_req.trim();
+fn cargo_dep_crate_name(crate_name: &str, lower_bound: Option<&str>) -> String {
+    let crate_base = spec::normalize_crate_name(crate_name);
 
-    // Handle wildcard
-    if req_str == "*" || req_str.is_empty() {
-        return None;
-    }
-
-    // Split by comma for multiple requirements, take the first one (usually the lower bound)
-    let first_req = req_str.split(',').next()?.trim();
-
-    // Remove operators: ^, ~, >=, >, =
-    let version_part = if first_req.starts_with(">=") {
-        &first_req[2..].trim()
-    } else if first_req.starts_with('>') || first_req.starts_with('=') || first_req.starts_with('~')
-    {
-        &first_req[1..].trim()
-    } else if first_req.starts_with('^') {
-        &first_req[1..].trim()
+    if let Some(version) = lower_bound {
+        if version.contains('-') {
+            format!("{}-{}", crate_base, version)
+        } else if let Ok(version) = Version::parse(version) {
+            format!(
+                "{}-{}",
+                crate_base,
+                crate::util::calculate_compat_version(&version)
+            )
+        } else {
+            crate_base
+        }
     } else {
-        first_req
-    };
-
-    // Parse version and normalize it
-    let parts: Vec<&str> = version_part.split('.').collect();
-    match parts.len() {
-        1 => Some(format!("{}.0.0", parts[0])),
-        2 => Some(format!("{}.{}.0", parts[0], parts[1])),
-        _ => Some(version_part.to_string()),
+        crate_base
     }
 }
 
-fn parse_deb_package_to_crate_dep(pkg_name: &str) -> Option<CrateDep> {
-    parse_package_name_simple(pkg_name)
+fn lower_bound_from_opt_version_req(version_req: &OptVersionReq) -> Option<String> {
+    match version_req {
+        OptVersionReq::Any => None,
+        OptVersionReq::Req(req) if req.to_string() == "*" => None,
+        OptVersionReq::Req(req) => req
+            .comparators
+            .iter()
+            .filter_map(lower_bound_from_comparator)
+            .max_by(compare_version_strings),
+        OptVersionReq::Locked(version, _) | OptVersionReq::Precise(version, _) => {
+            Some(version_without_build_metadata(version))
+        }
+    }
 }
 
+fn lower_bound_from_comparator(comparator: &semver::Comparator) -> Option<String> {
+    use semver::Op;
+
+    match comparator.op {
+        Op::Exact | Op::GreaterEq | Op::Tilde | Op::Caret => {
+            Some(comparator_lower_bound(comparator))
+        }
+        Op::Greater => Some(comparator_strict_lower_bound(comparator)),
+        Op::Wildcard if comparator.minor.is_some() || comparator.patch.is_some() => {
+            Some(comparator_lower_bound(comparator))
+        }
+        Op::Wildcard | Op::Less | Op::LessEq => None,
+        _ => None,
+    }
+}
+
+fn comparator_lower_bound(comparator: &semver::Comparator) -> String {
+    let mut version = format!(
+        "{}.{}.{}",
+        comparator.major,
+        comparator.minor.unwrap_or(0),
+        comparator.patch.unwrap_or(0)
+    );
+    if !comparator.pre.is_empty() {
+        version.push('-');
+        version.push_str(comparator.pre.as_str());
+    }
+    version
+}
+
+fn comparator_strict_lower_bound(comparator: &semver::Comparator) -> String {
+    if !comparator.pre.is_empty() {
+        // TODO: model strict prerelease bounds more precisely when RPM crate
+        // requirements grow beyond simple lower bounds.
+        return comparator_lower_bound(comparator);
+    }
+
+    match (comparator.minor, comparator.patch) {
+        (Some(minor), Some(patch)) => format!("{}.{}.{}", comparator.major, minor, patch + 1),
+        (Some(minor), None) => format!("{}.{}.0", comparator.major, minor + 1),
+        (None, None) => format!("{}.0.0", comparator.major + 1),
+        (None, Some(patch)) => format!("{}.0.{}", comparator.major, patch + 1),
+    }
+}
+
+fn version_without_build_metadata(version: &Version) -> String {
+    if !version.pre.is_empty() {
+        format!(
+            "{}.{}.{}-{}",
+            version.major, version.minor, version.patch, version.pre
+        )
+    } else {
+        format!("{}.{}.{}", version.major, version.minor, version.patch)
+    }
+}
+
+fn compare_version_strings(a: &String, b: &String) -> std::cmp::Ordering {
+    match (Version::parse(a), Version::parse(b)) {
+        (Ok(a), Ok(b)) => a.cmp(&b),
+        _ => a.cmp(b),
+    }
+}
+
+#[cfg(test)]
 /// 简化的包名解析函数
 /// 规则：
 /// 1. 去掉开头的 rust- 或 librust-
@@ -468,7 +486,7 @@ fn parse_deb_package_to_crate_dep(pkg_name: &str) -> Option<CrateDep> {
 ///
 /// 示例：
 ///   rust-md-5-0.10+default-dev -> CrateDep { crate_name: "md-5", feature: Some("default") }
-///   rust-serde-1.0+derive-dev -> CrateDep { crate_name: "serde", feature: Some("derive") }
+///   rust-serde-1+derive-dev -> CrateDep { crate_name: "serde", feature: Some("derive") }
 ///   rust-utf-8-0.7-dev -> CrateDep { crate_name: "utf-8", feature: None }
 ///   rust-proc-macro2-1-dev -> CrateDep { crate_name: "proc-macro2", feature: None }
 fn parse_package_name_simple(pkg_name: &str) -> Option<CrateDep> {
@@ -506,7 +524,7 @@ fn parse_package_name_simple(pkg_name: &str) -> Option<CrateDep> {
     // 找到最后一个版本号段的位置
     let version_idx = parts.iter().rposition(|part| {
         !part.is_empty()
-            && part.chars().next().map_or(false, |c| c.is_ascii_digit())
+            && part.chars().next().is_some_and(|c| c.is_ascii_digit())
             && part.chars().all(|c| c.is_ascii_digit() || c == '.')
     });
 
@@ -530,239 +548,62 @@ fn parse_package_name_simple(pkg_name: &str) -> Option<CrateDep> {
     Some(CrateDep::new(crate_name, feature))
 }
 
-fn extract_feature_from_package_name(pkg_name: &str, crate_base: &str) -> Option<String> {
-    // Extract feature name from package names like:
-    //   "rust-serde-default" with crate_base "serde" -> Some("default")
-    //   "rust-serde-std" with crate_base "serde" -> Some("std")
-    //   "rust-serde" with crate_base "serde" -> None (no feature)
+impl fmt::Display for Package {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let spec_package = SpecPackage {
+            feature: self.feature.clone(),
+            summary: format!("{}", self.summary),
+            description: format!("{}", self.description),
+            requires: self.spec_requires(),
+            provides: self.spec_provides(),
+            obsoletes: self.spec_obsoletes(),
+            conflicts: self.spec_conflicts(),
+            extra_lines: self.extra_lines.clone(),
+        };
 
-    // Do NOT clean package name - it's already in the right format from deb_feature_name()
-    let pkg = pkg_name;
-
-    // Remove rust- prefix
-    let without_prefix = if pkg.starts_with("rust-") {
-        &pkg[5..]
-    } else {
-        return None;
-    };
-
-    // Check if it starts with our crate name
-    let crate_with_dash = format!("{}-", crate_base);
-    if without_prefix == crate_base {
-        // Just the crate name, no feature
-        None
-    } else if without_prefix.starts_with(&crate_with_dash) {
-        // Has a feature suffix
-        Some(without_prefix[crate_with_dash.len()..].to_string())
-    } else {
-        None
+        if self.feature.is_some() {
+            spec::render_feature_package_section(f, &spec_package)
+        } else {
+            spec::render_main_package_section(f, &spec_package)
+        }
     }
 }
 
-impl fmt::Display for Package {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        // Determine relative name for package naming
-        // If self.feature is Some, this IS a feature package - always treat as such
-        let relative_name = if let Some(feature) = &self.feature {
-            feature // Always use feature name when feature is present
-        } else {
-            "" // Base package (no feature)
-        };
+fn crate_requirement_key(requirement: &CrateRequirement) -> String {
+    let rendered = spec::render_crate_requirement(requirement);
+    rendered
+        .split(' ')
+        .next()
+        .unwrap_or(rendered.as_str())
+        .to_string()
+}
 
-        if relative_name.is_empty() {
-            // Base package - no %package directive, no Summary (already in Source)
-        } else {
-            // Feature package - use relative name
-            writeln!(f)?;
-            let feature_name = base_deb_name(relative_name);
-            let feature_base_trimmed = feature_name.trim_start_matches('-');
-            writeln!(f, "%package     -n %{{name}}+{}", feature_base_trimmed)?;
-            writeln!(f, "Summary:        {}", self.summary)?;
+fn insert_crate_requirement(
+    dep_map: &mut std::collections::BTreeMap<String, CrateRequirement>,
+    requirement: CrateRequirement,
+) {
+    let key = crate_requirement_key(&requirement);
+    match dep_map.get(&key) {
+        Some(existing)
+            if requirement_has_version(&requirement) && !requirement_has_version(existing) =>
+        {
+            dep_map.insert(key, requirement);
         }
-
-        if !self.crate_deps.is_empty() {
-            // Output dependencies in crate() format using to_crate_format()
-            // Deduplicate: if same crate appears multiple times, keep only the one with version
-            use std::collections::BTreeMap;
-            let mut dep_map: BTreeMap<String, String> = BTreeMap::new();
-
-            for dep in &self.crate_deps {
-                let formatted = dep.to_crate_format();
-                // Extract just the crate(...) part as key for deduplication
-                let key = if let Some(space_pos) = formatted.find(' ') {
-                    formatted[..space_pos].to_string()
-                } else {
-                    formatted.clone()
-                };
-                // Keep the one with version constraint (longer string usually means it has version)
-                match dep_map.get(&key) {
-                    Some(existing) if formatted.len() > existing.len() => {
-                        dep_map.insert(key, formatted);
-                    }
-                    None => {
-                        dep_map.insert(key, formatted);
-                    }
-                    _ => {
-                        // Keep existing (already has version)
-                    }
-                }
-            }
-
-            // Output deduplicated dependencies
-            for formatted in dep_map.values() {
-                writeln!(f, "Requires:       {}", formatted)?;
+        Some(existing) => {
+            let existing_len = spec::render_crate_requirement(existing).len();
+            let new_len = spec::render_crate_requirement(&requirement).len();
+            if new_len > existing_len {
+                dep_map.insert(key, requirement);
             }
         }
-        // Add Provides in crate() format
-        // Main package: Provides: crate(serde)
-        // Feature package: Provides: crate(serde/alloc)
-        // Also parse self.provides for additional features (e.g., std provides default)
-        if let Some(crate_name) = &self.crate_name {
-            let crate_base = crate_name.replace('_', "-");
-
-            use std::collections::HashSet;
-            let mut provided_features = HashSet::new();
-
-            if relative_name.is_empty() {
-                // Main package provides crate(%{pkgname})
-                // println!("{:?}", self.crate_name);
-                // writeln!(f, "Provides:       crate(%{{crate_name}}) = %{{version}}")?;
-                writeln!(f, "Provides:       crate(%{{pkgname}})")?;
-                // if self.crate_name.as_deref() == Some("md-5")
-                //     || self.crate_name.as_deref() == Some("utf-8")
-                // {
-                //     writeln!(f, "Provides:       crate(%{{pkgname}}/default)")?;
-                // }
-
-                // For the main package, output all features from Cargo.toml
-                // This ensures all features are listed even if they don't have dependencies
-                // Convert to lowercase and normalize (underscore to hyphen)
-                if !self.all_features.is_empty() {
-                    let mut sorted_features: Vec<_> = self.all_features.iter().collect();
-                    sorted_features.sort();
-                    for feature in sorted_features {
-                        // Skip empty feature (represents main package)
-                        if !feature.is_empty() {
-                            let feature_normalized = feature.replace('_', "-").to_lowercase();
-                            // println!("Feature provided: {}", feature_normalized);
-                            provided_features.insert(feature_normalized.clone());
-                            writeln!(
-                                f,
-                                "Provides:       crate(%{{pkgname}}/{})",
-                                feature_normalized.trim_start_matches('-')
-                            )?;
-                        }
-                    }
-                }
-
-                // Also parse self.provides for additional features this main package provides
-                // (in case there are any edge cases not covered by all_features)
-                for provide in &self.provides {
-                    // Extract feature name from package like "rust-clap-unstable-derive-ui-tests"
-                    if let Some(additional_feature) =
-                        extract_feature_from_package_name(provide, &crate_base)
-                    {
-                        let additional_feature_lower = additional_feature.to_lowercase();
-                        provided_features.insert(additional_feature_lower);
-                    }
-                }
-
-                // Output any additional unique provides that weren't in all_features (already lowercase)
-                let all_features_lower: HashSet<_> = self
-                    .all_features
-                    .iter()
-                    .map(|f| f.replace('_', "-").to_lowercase())
-                    .collect();
-                let mut extra_features: Vec<_> = provided_features
-                    .into_iter()
-                    .filter(|f| !all_features_lower.contains(f))
-                    .collect();
-                extra_features.sort();
-                for feature in extra_features {
-                    // Check if not already in all_features
-                    if !self.all_features.contains(&feature)
-                        && !self.all_features.contains(&feature.replace('-', "_"))
-                    {
-                        let feature_base_trimmed = feature.trim_start_matches('-');
-                        writeln!(
-                            f,
-                            "Provides:       crate(%{{pkgname}}/{})",
-                            feature_base_trimmed
-                        )?;
-                    }
-                }
-            } else {
-                // Feature package provides crate(name/feature)
-                // Normalize feature name to use hyphens
-                let feature_base = base_deb_name(relative_name);
-                provided_features.insert(feature_base.clone());
-
-                // Parse self.provides for additional features
-                // e.g., "rust-serde-default" means this package also provides the "default" feature
-                for provide in &self.provides {
-                    // Extract feature name from package like "rust-serde-default"
-                    if let Some(additional_feature) =
-                        extract_feature_from_package_name(provide, &crate_base)
-                    {
-                        provided_features.insert(additional_feature);
-                    }
-                }
-
-                // Output all unique provides in sorted order for consistency
-                let mut features: Vec<_> = provided_features.into_iter().collect();
-                features.sort();
-                for feature in features {
-                    let feature_base_trimmed = feature.trim_start_matches('-');
-                    writeln!(
-                        f,
-                        "Provides:       crate(%{{pkgname}}/{})",
-                        feature_base_trimmed
-                    )?;
-                }
-            }
+        None => {
+            dep_map.insert(key, requirement);
         }
-        if !self.replaces.is_empty() {
-            for rep in &self.replaces {
-                let cleaned = rep.split('(').next().unwrap_or(rep).trim();
-                let clean_name = clean_package_name(cleaned);
-                writeln!(f, "Obsoletes:      {}", clean_name)?;
-            }
-        }
-        if !self.breaks.is_empty() {
-            for brk in &self.breaks {
-                let cleaned = brk.split('(').next().unwrap_or(brk).trim();
-                let clean_name = clean_package_name(cleaned);
-                writeln!(f, "Conflicts:      {}", clean_name)?;
-            }
-        }
-
-        for line in &self.extra_lines {
-            writeln!(f, "{}", line)?;
-        }
-
-        // Use same logic to determine relative name for description
-        // If self.feature is Some, this IS a feature package - always treat as such
-        let relative_name = if let Some(feature) = &self.feature {
-            feature // Always use feature name when feature is present
-        } else {
-            "" // Base package (no feature)
-        };
-
-        writeln!(f)?;
-        if relative_name.is_empty() {
-            writeln!(f, "%description")?;
-        } else {
-            let feature_name = base_deb_name(relative_name);
-            let feature_base_trimmed = feature_name.trim_start_matches('-');
-            writeln!(f, "%description -n %{{name}}+{}", feature_base_trimmed)?;
-        }
-        let description = format!("{}", &self.description);
-        for line in description.lines() {
-            writeln!(f, "{}", line.trim())?;
-        }
-
-        Ok(())
     }
+}
+
+fn requirement_has_version(requirement: &CrateRequirement) -> bool {
+    !matches!(requirement.requirement, RequirementVersion::None)
 }
 
 impl fmt::Display for PkgTest {
@@ -828,11 +669,7 @@ impl Source {
         repository: &str,
         license: &str,
         lib: bool,
-        maintainer: String,
-        uploaders: Vec<String>,
         build_deps: BuildDeps,
-        requires_root: Option<String>,
-        download_url: String,
         full_version: String,   // Full version including build metadata
         sha256: Option<String>, // SHA256 hash of downloaded crate file
     ) -> Result<Source> {
@@ -845,7 +682,6 @@ impl Source {
         } else {
             "FIXME-IN-THE-SOURCE-SECTION"
         };
-        let priority = "optional".to_string();
         let vcs_browser = format!(
             "https://salsa.debian.org/rust-team/takopack-conf/tree/master/src/{}",
             pkgbase
@@ -865,9 +701,6 @@ impl Source {
             version: version.to_string(),
             full_version,
             section: section.to_string(),
-            priority,
-            maintainer,
-            uploaders,
             standards: "4.7.2".to_string(),
             build_deps,
             vcs_git,
@@ -875,8 +708,6 @@ impl Source {
             homepage: home.to_string(),
             crate_name: crate_name.to_string(),
             license: license.to_string(),
-            requires_root,
-            download_url,
             sha256,
         })
     }
@@ -953,6 +784,77 @@ impl Package {
         } else {
             "rust"
         }
+    }
+
+    fn spec_requires(&self) -> Vec<CrateRequirement> {
+        // Deduplicate by the crate(...) key, preferring versioned requirements.
+        let mut dep_map: std::collections::BTreeMap<String, CrateRequirement> =
+            std::collections::BTreeMap::new();
+
+        for requirement in &self.crate_requires {
+            insert_crate_requirement(&mut dep_map, requirement.clone());
+        }
+
+        for dep in &self.crate_deps {
+            let requirement = dep.to_crate_requirement();
+            insert_crate_requirement(&mut dep_map, requirement);
+        }
+
+        dep_map.into_values().collect()
+    }
+
+    fn spec_provides(&self) -> Vec<CrateCapability> {
+        if self.crate_name.is_none() {
+            return vec![];
+        }
+
+        let mut capabilities = vec![];
+        let mut features = std::collections::BTreeSet::new();
+
+        if let Some(feature) = &self.feature {
+            if !feature.is_empty() {
+                features.insert(spec::normalize_feature_name(feature));
+            }
+            for feature in &self.feature_provides {
+                if !feature.is_empty() {
+                    features.insert(spec::normalize_feature_name(feature));
+                }
+            }
+        } else {
+            capabilities.push(CrateCapability::package_feature(None));
+            for feature in self.all_features.iter().chain(self.feature_provides.iter()) {
+                if !feature.is_empty() {
+                    features.insert(spec::normalize_feature_name(feature));
+                }
+            }
+        }
+
+        capabilities.extend(
+            features
+                .into_iter()
+                .map(|feature| CrateCapability::package_feature(Some(feature))),
+        );
+        capabilities
+    }
+
+    fn spec_obsoletes(&self) -> Vec<String> {
+        self.replaces
+            .iter()
+            .map(|rep| {
+                let cleaned = rep.split('(').next().unwrap_or(rep).trim();
+                clean_package_name(cleaned)
+            })
+            .collect()
+    }
+
+    fn spec_conflicts(&self) -> Vec<String> {
+        self.breaks
+            .iter()
+            .map(|brk| {
+                let cleaned = brk.split('(').next().unwrap_or(brk).trim();
+                clean_package_name(cleaned)
+            })
+            .collect()
     }
 
     /// Apply lockfile dependencies
@@ -1070,156 +972,10 @@ impl Package {
             }
         }
 
-        // Parse o_deps (external crate dependencies) into CrateDep format
-        // These are external crates, so they get version constraints
-        // Use a map to collect all constraints for each crate+feature combination
-        use std::collections::HashMap;
-        let mut temp_deps: HashMap<(String, Option<String>), Vec<String>> = HashMap::new();
-
         for o_dep in o_deps.iter() {
             depends.push(o_dep.clone());
-
-            // Parse package name and version from strings like:
-            // "rust-serde-core-1.0+result-dev (>= 1.0.228-~~)"
-            // "rust-proc-macro2-1-dev (>= 1.0-~~)"
-            // "rust-clippy-lints-0.0+default-dev (>= 0.0.112-~~)" and (<< 0.0.113-~~)
-            // Note: RPM spec only supports ">=" constraints, so we skip "<< " constraints
-            let (pkg_name, version_constraint) = if let Some(idx) = o_dep.find(" (") {
-                let pkg = o_dep[..idx].trim();
-                let ver_part = &o_dep[idx + 2..]; // Skip " ("
-
-                // Only extract ">=" constraints, ignore "<<" (upper bound)
-                // RPM spec format only supports lower bounds with ">="
-                let version = if let Some(start_idx) = ver_part.find(">= ") {
-                    let ver_str = &ver_part[start_idx + 3..];
-                    if let Some(end_idx) = ver_str.find(|c| c == '-' || c == ')') {
-                        Some(format!(">= {}", &ver_str[..end_idx]))
-                    } else {
-                        None
-                    }
-                } else if ver_part.contains("<< ") {
-                    // Skip upper bound constraints - not supported in RPM spec
-                    continue;
-                } else {
-                    None
-                };
-                (pkg, version)
-            } else {
-                // No version in parentheses, will get version from ori_deps later
-                (o_dep.trim(), None)
-            };
-            // println!("pkg_name: {}", pkg_name);
-            // Extract crate name and feature from package name
-            if let Some(mut crate_dep) = parse_deb_package_to_crate_dep(pkg_name) {
-                // The parsed crate name may not be accurate (especially with numeric parts like x86-64, base64, sha2, etc.)
-                // Find the real crate name and version from ori_deps by matching normalized names
-                let normalized_parsed_name = crate_dep.crate_name.replace('-', "_");
-                // println!("normalized_parsed_name: {}", normalized_parsed_name);
-                // Search for matching dependency in ori_deps
-                if let Some(matching_dep) = ori_deps.iter().find(|dep| {
-                    let dep_name = dep.package_name().replace('-', "_");
-                    // println!("dep_name: {}", dep_name);
-                    dep_name == normalized_parsed_name
-                }) {
-                    // Use the real crate name from Cargo metadata
-                    let real_crate_name = matching_dep.package_name().to_string();
-                    // println!("real: {real_crate_name}");
-                    crate_dep.crate_name = real_crate_name;
-
-                    // If no version constraint from takopack package string, get it from ori_deps
-                    if version_constraint.is_none() {
-                        let version_req = matching_dep.version_req();
-                        // Convert semver VersionReq to our format
-                        // For simplicity, extract the minimum version from the requirement
-                        let version_str = format!("{}", version_req);
-                        if !version_str.is_empty() && version_str != "*" {
-                            // Parse version requirement like "^0.9" or ">=1.0, <2.0"
-                            // For now, extract the first number sequence as minimum version
-                            if let Some(version) = parse_version_req_to_lower_bound(&version_str) {
-                                crate_dep.version = Some(format!(">= {}", version));
-                            }
-                        }
-                    } else {
-                        crate_dep.version = version_constraint.clone();
-                    }
-                } else if let Some(ver) = version_constraint {
-                    // Couldn't find in ori_deps, use the version from takopack package
-                    crate_dep.version = Some(ver);
-                }
-                let dep_crate_base = crate_dep.crate_name.replace('_', "-");
-                let self_crate_base = basename.replace('_', "-");
-                if dep_crate_base != self_crate_base {
-                    // Collect all version constraints for this crate+feature
-                    let key = (crate_dep.crate_name.clone(), crate_dep.feature.clone());
-                    let entry = temp_deps.entry(key).or_insert_with(Vec::new);
-                    if let Some(ver) = &crate_dep.version {
-                        entry.push(ver.clone());
-                    }
-                }
-            }
         }
-
-        // Now merge the constraints and create CrateDep entries
-        for ((crate_name, feature), constraints) in temp_deps {
-            // Separate >= and < constraints
-            let mut lower_bounds = vec![];
-            let mut upper_bounds = vec![];
-
-            for constraint in constraints {
-                if constraint.starts_with(">=") {
-                    // Extract version from ">= x.y.z"
-                    if let Some(ver_str) = constraint.strip_prefix(">= ") {
-                        lower_bounds.push(ver_str.trim().to_string());
-                    }
-                } else if constraint.starts_with('<') {
-                    // Extract version from "< x.y.z"
-                    if let Some(ver_str) = constraint.strip_prefix("< ") {
-                        upper_bounds.push(ver_str.trim().to_string());
-                    }
-                }
-            }
-
-            // Helper function to compare version strings
-            let parse_version = |v: &str| -> Vec<u64> {
-                v.split('.').filter_map(|s| s.parse::<u64>().ok()).collect()
-            };
-
-            let compare_versions = |a: &str, b: &str| -> std::cmp::Ordering {
-                let va = parse_version(a);
-                let vb = parse_version(b);
-                va.cmp(&vb)
-            };
-
-            // Find maximum lower bound
-            let lower_bound = if !lower_bounds.is_empty() {
-                lower_bounds.sort_by(|a, b| compare_versions(a, b));
-                Some(format!(">= {}", lower_bounds.last().unwrap()))
-            } else {
-                None
-            };
-
-            // Find minimum upper bound
-            let upper_bound = if !upper_bounds.is_empty() {
-                upper_bounds.sort_by(|a, b| compare_versions(a, b));
-                Some(format!("< {}", upper_bounds.first().unwrap()))
-            } else {
-                None
-            };
-
-            // Combine constraints
-            let version = match (lower_bound, upper_bound) {
-                (Some(l), Some(u)) => Some(format!("{}, {}", l, u)),
-                (Some(l), None) => Some(l),
-                (None, Some(u)) => Some(u),
-                (None, None) => None,
-            };
-
-            crate_deps.push(CrateDep {
-                crate_name,
-                feature,
-                version,
-            });
-        }
+        let crate_requires = crate_requirements_from_cargo_deps(&ori_deps, basename);
         let mut breaks = vec![];
         let mut replaces = vec![];
         if name_suffix.is_some() && feature.is_none() {
@@ -1263,9 +1019,14 @@ impl Package {
             section: None,
             depends,
             crate_deps,
+            crate_requires,
             recommends,
             suggests,
             provides,
+            feature_provides: f_provides
+                .iter()
+                .map(|feature| feature.to_string())
+                .collect(),
             breaks,
             replaces,
             conflicts,
@@ -1304,9 +1065,11 @@ impl Package {
                 "${cargo:Depends}".to_string(),
             ],
             crate_deps: vec![],
+            crate_requires: vec![],
             recommends: vec!["${cargo:Recommends}".to_string()],
             suggests: vec!["${cargo:Suggests}".to_string()],
             provides,
+            feature_provides: vec![],
             breaks: vec![],
             replaces: vec![],
             conflicts: vec![],
@@ -1330,9 +1093,11 @@ impl Package {
             section: Default::default(),
             depends: Default::default(),
             crate_deps: Default::default(),
+            crate_requires: Default::default(),
             recommends: Default::default(),
             suggests: Default::default(),
             provides: Default::default(),
+            feature_provides: Default::default(),
             breaks: Default::default(),
             replaces: Default::default(),
             conflicts: Default::default(),
@@ -1509,38 +1274,300 @@ pub fn deb_feature_name(name: &str, feature: &str) -> String {
     )
 }
 
-/// Retrieve one of a series of environment variables, and provide a friendly error message for
-/// non-UTF-8 values.
-#[cfg(not(test))]
-fn get_envs(keys: &[&str]) -> Result<Option<String>> {
-    for key in keys {
-        match env::var(key) {
-            Ok(val) => {
-                return Ok(Some(val));
-            }
-            Err(e @ VarError::NotUnicode(_)) => {
-                return Err(Error::from(e)
-                    .context(format!("Environment variable ${} not valid UTF-8", key)));
-            }
-            Err(VarError::NotPresent) => {}
+#[cfg(test)]
+mod tests {
+    use super::{
+        crate_requirements_from_cargo_deps, parse_package_name_simple, BuildDeps, CrateDep, Source,
+    };
+    use crate::crates::{all_dependencies_and_features, transitive_deps};
+    use crate::takopack::spec;
+    use cargo::core::{dependency::DepKind, Dependency, EitherManifest, SourceId};
+    use cargo::util::toml::read_manifest;
+    use cargo::GlobalContext;
+    use std::fs;
+
+    fn test_dep(
+        name: &str,
+        version: &str,
+        uses_default_features: bool,
+        features: &[&str],
+    ) -> Dependency {
+        let source_id = SourceId::for_path(&std::env::current_dir().unwrap()).unwrap();
+        let mut dep = Dependency::parse(name, Some(version), source_id).unwrap();
+        dep.set_default_features(uses_default_features);
+        dep.set_features(features.iter().copied());
+        dep
+    }
+
+    fn manifest_from_toml(toml: &str) -> cargo::core::Manifest {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("src")).unwrap();
+        fs::write(temp.path().join("src/lib.rs"), "pub fn marker() {}\n").unwrap();
+        let cargo_toml = temp.path().join("Cargo.toml");
+        fs::write(&cargo_toml, toml).unwrap();
+        let source_id = SourceId::for_path(temp.path()).unwrap();
+        match read_manifest(&cargo_toml, source_id, &GlobalContext::default().unwrap()).unwrap() {
+            EitherManifest::Real(manifest) => manifest,
+            _ => panic!("expected real manifest"),
         }
     }
-    Ok(None)
-}
 
-#[cfg(test)]
-pub(crate) fn get_deb_author() -> Result<String> {
-    Ok("takopack Test <takopack@example.com>".to_string())
-}
+    fn rendered_cargo_requirements(deps: &[Dependency]) -> Vec<String> {
+        rendered_cargo_requirements_for_crate(deps, "current_crate")
+    }
 
-/// Determine a name and email address from environment variables.
-#[cfg(not(test))]
-pub fn get_deb_author() -> Result<String> {
-    let name = get_envs(&["DEBFULLNAME", "NAME"])?.ok_or_else(|| {
-        format_err!("Unable to determine your name; please set $DEBFULLNAME or $NAME")
-    })?;
-    let email = get_envs(&["DEBEMAIL", "EMAIL"])?.ok_or_else(|| {
-        format_err!("Unable to determine your email; please set $DEBEMAIL or $EMAIL")
-    })?;
-    Ok(format!("{} <{}>", name, email))
+    fn rendered_cargo_requirements_for_crate(
+        deps: &[Dependency],
+        current_crate_name: &str,
+    ) -> Vec<String> {
+        crate_requirements_from_cargo_deps(deps, current_crate_name)
+            .into_iter()
+            .map(|requirement| spec::render_crate_requires(&requirement))
+            .collect()
+    }
+
+    fn rendered_feature_requirements(toml: &str, feature: &str) -> Vec<String> {
+        let manifest = manifest_from_toml(toml);
+        let features_with_deps = all_dependencies_and_features(&manifest).unwrap();
+        let (_, deps) = transitive_deps(&features_with_deps, feature).unwrap();
+        rendered_cargo_requirements_for_crate(&deps, manifest.name().as_str())
+    }
+
+    #[test]
+    fn source_header_uses_major_branch_for_package_names() {
+        let source = Source::new(
+            "clap",
+            "4.6.1",
+            None,
+            "clap",
+            "https://example.invalid/clap",
+            "",
+            "MIT OR Apache-2.0",
+            true,
+            BuildDeps::default(),
+            "4.6.1".to_string(),
+            None,
+        )
+        .unwrap();
+        let rendered = source.to_string();
+
+        assert!(rendered.contains("%global pkgname clap-4"));
+        assert!(rendered.contains("Name:           rust-clap-4"));
+    }
+
+    #[test]
+    fn cargo_dependency_default_features_require_default_capability() {
+        let dep = test_dep("base64", "0.22.1", true, &[]);
+        let rendered = rendered_cargo_requirements(&[dep]);
+
+        assert_eq!(
+            vec!["Requires:       crate(base64-0.22/default) >= 0.22.1"],
+            rendered
+        );
+    }
+
+    #[test]
+    fn cargo_dependency_default_features_false_requires_base_capability() {
+        let dep = test_dep("base64", "0.22.1", false, &[]);
+        let rendered = rendered_cargo_requirements(&[dep]);
+
+        assert!(rendered
+            .iter()
+            .all(|line| !line.contains("crate(base64-0.22/default)")));
+        assert_eq!(
+            vec!["Requires:       crate(base64-0.22) >= 0.22.1"],
+            rendered
+        );
+    }
+
+    #[test]
+    fn cargo_dependency_explicit_features_include_default_when_enabled() {
+        let dep = test_dep("serde", "1", true, &["derive", "std"]);
+        let rendered = rendered_cargo_requirements(&[dep]);
+
+        assert_eq!(
+            vec![
+                "Requires:       crate(serde-1/default) >= 1.0.0",
+                "Requires:       crate(serde-1/derive) >= 1.0.0",
+                "Requires:       crate(serde-1/std) >= 1.0.0",
+            ],
+            rendered
+        );
+    }
+
+    #[test]
+    fn cargo_dependency_explicit_features_skip_default_when_disabled() {
+        let dep = test_dep("serde", "1", false, &["derive"]);
+        let rendered = rendered_cargo_requirements(&[dep]);
+
+        assert!(rendered
+            .iter()
+            .all(|line| !line.contains("crate(serde-1/default)")));
+        assert_eq!(
+            vec!["Requires:       crate(serde-1/derive) >= 1.0.0"],
+            rendered
+        );
+    }
+
+    #[test]
+    fn cargo_dependency_major_four_uses_major_branch() {
+        let dep = test_dep("clap-builder", "4.6.0", true, &[]);
+        let rendered = rendered_cargo_requirements(&[dep]);
+
+        assert_eq!(
+            vec!["Requires:       crate(clap-builder-4/default) >= 4.6.0"],
+            rendered
+        );
+    }
+
+    #[test]
+    fn non_optional_cargo_build_dependency_requires_base_crate_capability() {
+        let mut dep = test_dep("cc", "1", true, &[]);
+        dep.set_kind(DepKind::Build);
+
+        assert_eq!(
+            vec!["Requires:       crate(cc-1) >= 1.0.0"],
+            rendered_cargo_requirements(&[dep])
+        );
+    }
+
+    #[test]
+    fn cargo_dev_dependency_does_not_enter_runtime_crate_requires() {
+        let mut dep = test_dep("proptest", "1", true, &[]);
+        dep.set_kind(DepKind::Development);
+
+        assert!(rendered_cargo_requirements(&[dep]).is_empty());
+    }
+
+    #[test]
+    fn onig_sys_style_build_dependencies_are_rendered_without_optional_leakage() {
+        let toml = r#"
+[package]
+name = "onig_sys"
+version = "69.9.3"
+edition = "2021"
+
+[build-dependencies]
+bindgen = { version = "0.72", optional = true, features = ["runtime"] }
+pkg-config = "^0.3.16"
+cc = "1.0"
+
+[dev-dependencies]
+proptest = "1"
+
+[features]
+default = ["generate"]
+generate = ["bindgen"]
+"#;
+
+        let base = rendered_feature_requirements(toml, "");
+        assert!(base.contains(&"Requires:       crate(cc-1) >= 1.0.0".to_string()));
+        assert!(base.contains(&"Requires:       crate(pkg-config-0.3) >= 0.3.16".to_string()));
+        assert!(base.iter().all(|line| !line.contains("bindgen")));
+        assert!(base.iter().all(|line| !line.contains("proptest")));
+
+        let generate = rendered_feature_requirements(toml, "generate");
+        assert!(generate.contains(&"Requires:       crate(cc-1) >= 1.0.0".to_string()));
+        assert!(generate.contains(&"Requires:       crate(pkg-config-0.3) >= 0.3.16".to_string()));
+        assert!(generate
+            .iter()
+            .any(|line| line == "Requires:       crate(bindgen-0.72/runtime) >= 0.72.0"));
+        assert!(generate.iter().all(|line| !line.contains("proptest")));
+    }
+
+    #[test]
+    fn target_specific_normal_dependency_enters_provider_crate_requires() {
+        let mut dep = test_dep("windows-win", "3", true, &[]);
+        dep.set_platform(Some("cfg(windows)".parse().unwrap()));
+
+        assert_eq!(
+            vec!["Requires:       crate(windows-win-3/default) >= 3.0.0"],
+            rendered_cargo_requirements(&[dep])
+        );
+    }
+
+    #[test]
+    fn target_specific_dev_dependency_does_not_enter_provider_crate_requires() {
+        let mut dep = test_dep("windows-dev", "1", true, &[]);
+        dep.set_kind(DepKind::Development);
+        dep.set_platform(Some("cfg(windows)".parse().unwrap()));
+
+        assert!(rendered_cargo_requirements(&[dep]).is_empty());
+    }
+
+    #[test]
+    fn target_specific_optional_dependency_stays_feature_scoped() {
+        let toml = r#"
+[package]
+name = "target_optional"
+version = "1.0.0"
+edition = "2021"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", optional = true, default-features = false, features = ["Win32_Foundation"] }
+
+[features]
+default = []
+windows = ["dep:windows-sys"]
+"#;
+
+        let base = rendered_feature_requirements(toml, "");
+        assert!(base.iter().all(|line| !line.contains("windows-sys")));
+
+        let windows = rendered_feature_requirements(toml, "windows");
+        assert_eq!(
+            vec!["Requires:       crate(windows-sys-0.61/win32-foundation) >= 0.61.0"],
+            windows
+        );
+    }
+
+    #[test]
+    fn rustc_workspace_dependency_does_not_enter_runtime_crate_requires() {
+        let dep = test_dep("rustc-std-workspace-core", "1", true, &[]);
+
+        assert!(rendered_cargo_requirements(&[dep]).is_empty());
+    }
+
+    #[test]
+    fn cargo_wildcard_dependency_does_not_generate_x_capability() {
+        let dep = test_dep("base64", "0.22.*", false, &[]);
+        let rendered = rendered_cargo_requirements(&[dep]);
+
+        assert!(rendered.iter().all(|line| !line.contains(".x")));
+        assert_eq!(
+            vec!["Requires:       crate(base64-0.22) >= 0.22.0"],
+            rendered
+        );
+    }
+
+    #[test]
+    fn cargo_greater_than_dependency_uses_next_patch_lower_bound() {
+        let dep = test_dep("serde", "> 1.2.3", false, &[]);
+        let rendered = rendered_cargo_requirements(&[dep]);
+
+        assert_eq!(vec!["Requires:       crate(serde-1) >= 1.2.4"], rendered);
+    }
+
+    #[test]
+    fn same_crate_feature_dependencies_remain_exact_version() {
+        assert_eq!(
+            "crate(%{pkgname}) = %{version}",
+            CrateDep::new("%{pkgname}".to_string(), None).to_crate_format()
+        );
+        assert_eq!(
+            "crate(%{pkgname}/std) = %{version}",
+            CrateDep::new("%{pkgname}".to_string(), Some("std".to_string())).to_crate_format()
+        );
+    }
+
+    #[test]
+    fn legacy_package_parser_only_uses_explicit_plus_features() {
+        let plain_rc = parse_package_name_simple("rust-example-rc-dev").unwrap();
+        assert_eq!("example-rc", plain_rc.crate_name);
+        assert_eq!(None, plain_rc.feature.as_deref());
+
+        let feature_rc = parse_package_name_simple("rust-example-1.0+rc-dev").unwrap();
+        assert_eq!("example", feature_rc.crate_name);
+        assert_eq!(Some("rc"), feature_rc.feature.as_deref());
+    }
 }

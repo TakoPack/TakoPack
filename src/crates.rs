@@ -1,4 +1,4 @@
-use anyhow::{format_err, Error};
+use anyhow::{format_err, Context, Error};
 use cargo::{
     core::{
         manifest::ManifestMetadata, registry::PackageRegistry, resolver::features::CliFeatures,
@@ -12,7 +12,7 @@ use cargo::{
     },
     util::{
         cache_lock::CacheLockMode, interning::InternedString, toml::read_manifest, FileLock,
-        GlobalContext,
+        Filesystem, GlobalContext,
     },
 };
 use filetime::{set_file_times, FileTime};
@@ -91,6 +91,45 @@ pub fn crate_name_ver_to_dep(crate_name: &str, version: Option<&str>) -> Result<
         }
     });
     Dependency::parse(crate_name, version.as_deref(), source_id)
+}
+
+/// Select the highest crates.io version that satisfies a Cargo dependency
+/// requirement string.
+///
+/// Unlike `crate_name_ver_to_dep`, this treats `version_req` as dependency
+/// syntax (`"0.29"` means caret-compatible `0.29`, not exact `=0.29`).
+pub fn resolve_crates_io_version_req(crate_name: &str, version_req: &str) -> Result<Version> {
+    let context = GlobalContext::default()?;
+    let source_id = SourceId::crates_io_maybe_sparse_http(&context)?;
+    let version_req = if version_req.trim().is_empty() {
+        None
+    } else {
+        Some(version_req.trim())
+    };
+    let dep = Dependency::parse(crate_name, version_req, source_id)?;
+
+    let lock = context.acquire_package_cache_lock(CacheLockMode::DownloadExclusive)?;
+    let mut registry =
+        PackageRegistry::new_with_source_config(&context, SourceConfigMap::new(&context)?)?;
+    registry.lock_patches();
+    let summaries = fetch_candidates(&mut registry, &dep)?;
+    drop(lock);
+
+    let pkgid = summaries
+        .into_iter()
+        .map(|summary| summary.package_id())
+        .max()
+        .ok_or_else(|| {
+            format_err!(
+                concat!(
+                    "Couldn't find any crate matching {}\n",
+                    "Try `takopack update` to update the crates.io index."
+                ),
+                show_dep(&dep)
+            )
+        })?;
+
+    Ok(pkgid.version().clone())
 }
 
 // attempt to map back a version requirement to a version that can be used as last resort
@@ -244,59 +283,37 @@ impl CrateInfo {
         let context = GlobalContext::default()?;
         let crate_dir = cargo_toml.parent().unwrap();
 
-        // Check if we have a complete crate with src/
-        let has_src = crate_dir.join("src").exists();
+        log::info!("Creating CrateInfo directly from local Cargo.toml");
 
-        if has_src {
-            // Use path source for complete crates
-            let source_id = SourceId::for_path(crate_dir)?;
-            let manifest = match read_manifest(cargo_toml, source_id, &context)? {
-                EitherManifest::Real(m) => m,
-                _ => anyhow::bail!("Virtual manifests are not supported"),
-            };
+        let source_id = SourceId::for_path(crate_dir)?;
+        let manifest = match read_manifest(cargo_toml, source_id, &context)? {
+            EitherManifest::Real(m) => m,
+            _ => anyhow::bail!("Virtual manifests are not supported"),
+        };
 
-            let crate_name = manifest.name().as_str();
-            let version = manifest.version().to_string();
-            Self::new_with_local_crate(crate_name, Some(&version), crate_dir)
-        } else {
-            // For standalone Cargo.toml without source code, use a dummy source_id
-            log::info!("Creating CrateInfo from standalone Cargo.toml without source code");
+        let crate_name = manifest.name().as_str();
+        let version = manifest.version().to_string();
+        let package = Package::new(manifest.clone(), cargo_toml);
 
-            // Use registry source_id since we don't have a real path source
-            let source_id = SourceId::crates_io_maybe_sparse_http(&context)?;
+        let package_dir = crate_dir.join(".takopack-localpkg").join("package");
+        fs::create_dir_all(&package_dir)?;
 
-            let manifest = match read_manifest(cargo_toml, source_id, &context)? {
-                EitherManifest::Real(m) => m,
-                _ => anyhow::bail!("Virtual manifests are not supported"),
-            };
+        let filename = format!("{}-{}.crate", crate_name, version);
+        let crate_file = Filesystem::new(package_dir).open_rw_exclusive_create(
+            filename,
+            &context,
+            "dummy localpkg crate file",
+        )?;
 
-            let crate_name = manifest.name().as_str();
-            let version = manifest.version().to_string();
-
-            // Create Package directly from manifest
-            let package = Package::new(manifest.clone(), cargo_toml);
-
-            // Create a dummy crate file
-            let target_dir = context
-                .target_dir()?
-                .ok_or_else(|| anyhow::anyhow!("Target directory not set"))?;
-            let package_dir = target_dir.join("package");
-            fs::create_dir_all(package_dir.as_path_unlocked())?;
-
-            let filename = format!("{}-{}.crate", crate_name, version);
-            let crate_file =
-                package_dir.open_rw_exclusive_create(filename, &context, "dummy crate file")?;
-
-            Ok(CrateInfo {
-                package,
-                manifest,
-                crate_file,
-                context,
-                source_id,
-                excludes: vec![],
-                includes: vec![],
-            })
-        }
+        Ok(CrateInfo {
+            package,
+            manifest,
+            crate_file,
+            context,
+            source_id,
+            excludes: vec![],
+            includes: vec![],
+        })
     }
 
     pub fn new_with_update(
@@ -683,9 +700,19 @@ impl CrateInfo {
 
     pub fn extract_crate(&mut self, path: &Path) -> Result<bool> {
         let mut archive = Archive::new(GzDecoder::new(self.crate_file.file()));
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "Could not create parent directory for source directory {}",
+                path.display()
+            )
+        })?;
         let tempdir = tempfile::Builder::new()
             .prefix("takopack")
-            .tempdir_in(".")?;
+            .tempdir_in(parent)?;
         let mut source_modified = false;
         let mut last_mtime = 0;
         let mut err = vec![];
@@ -886,7 +913,7 @@ impl CrateInfo {
 
 /// Collect information about the dependency structure of features and
 /// their external crate dependencies, in a simple output format.
-pub fn all_dependencies_and_features(manifest: &Manifest) -> CrateDepInfo {
+pub fn all_dependencies_and_features(manifest: &Manifest) -> Result<CrateDepInfo> {
     all_dependencies_and_features_filtered(manifest, false)
 }
 
@@ -896,13 +923,10 @@ pub fn all_dependencies_and_features(manifest: &Manifest) -> CrateDepInfo {
 pub fn all_dependencies_and_features_filtered(
     manifest: &Manifest,
     include_dev_dependencies: bool,
-) -> CrateDepInfo {
-    use cargo::core::dependency::DepKind;
-
+) -> Result<CrateDepInfo> {
     let mut deps_by_name: BTreeMap<&str, Vec<&Dependency>> = BTreeMap::new();
     for dep in manifest.dependencies() {
-        // we treat build-dependencies also as dependencies in takopack
-        if include_dev_dependencies || dep.kind() != DepKind::Development {
+        if dependency_is_runtime_candidate(dep, include_dev_dependencies) {
             let s = dep.name_in_toml().as_str();
             deps_by_name.entry(s).or_default().push(dep);
         }
@@ -923,12 +947,41 @@ pub fn all_dependencies_and_features_filtered(
                     feature_deps.push(InternedString::new(dep_feature).as_str())
                 }
                 // another package is a dependency
-                Dep { dep_name } => {
-                    // unwrap is ok, valid Cargo.toml files must have this
-                    for &dep in deps_by_name.get(dep_name.as_str()).unwrap() {
-                        other_deps.push(dep.clone());
+                Dep { dep_name } => match deps_by_name.get(dep_name.as_str()) {
+                    Some(dd) => {
+                        for &dep in dd {
+                            other_deps.push(dep.clone());
+                        }
                     }
-                }
+                    None if dependency_is_dev_dependency(manifest, dep_name.as_str()) => {
+                        takopack_warn!(
+                            "Ignoring \"{}\" feature \"{}\" as it depends on a \
+                                 dev-dependency \"{}\"",
+                            manifest.package_id(),
+                            feature,
+                            dep_name
+                        );
+                    }
+                    None if dependency_is_filtered_runtime_dependency(
+                        manifest,
+                        dep_name.as_str(),
+                        include_dev_dependencies,
+                    ) =>
+                    {
+                        takopack_warn!(
+                            "Ignoring \"{}\" feature \"{}\" as it depends on filtered runtime dependency \"{}\"",
+                            manifest.package_id(),
+                            feature,
+                            dep_name
+                        );
+                    }
+                    None => takopack_bail!(
+                        "failed to account for dependency \"{}\" of \"{}\" feature \"{}\"",
+                        dep_name,
+                        manifest.package_id(),
+                        feature
+                    ),
+                },
                 // another package is a dependency
                 DepFeature {
                     dep_name,
@@ -949,16 +1002,7 @@ pub fn all_dependencies_and_features_filtered(
                             }
                         }
                         None => {
-                            let mut expected = false;
-                            for dep in manifest.dependencies() {
-                                if dep.kind() == DepKind::Development {
-                                    let s = dep.name_in_toml().as_str();
-                                    if s == dep_name.as_str() {
-                                        expected = true;
-                                    }
-                                }
-                            }
-                            if expected {
+                            if dependency_is_dev_dependency(manifest, dep_name.as_str()) {
                                 takopack_warn!(
                                     "Ignoring \"{}\" feature \"{}\" as it depends on a \
                                      dev-dependency \"{}\"",
@@ -966,10 +1010,23 @@ pub fn all_dependencies_and_features_filtered(
                                     feature,
                                     dep_name
                                 );
+                            } else if dependency_is_filtered_runtime_dependency(
+                                manifest,
+                                dep_name.as_str(),
+                                include_dev_dependencies,
+                            ) {
+                                takopack_warn!(
+                                    "Ignoring \"{}\" feature \"{}\" as it depends on filtered runtime dependency \"{}\"",
+                                    manifest.package_id(),
+                                    feature,
+                                    dep_name
+                                );
                             } else {
-                                panic!(
+                                takopack_bail!(
                                     "failed to account for dependency \"{}\" of \"{}\" feature \"{}\"",
-                                    dep_name, manifest.package_id(), feature
+                                    dep_name,
+                                    manifest.package_id(),
+                                    feature
                                 );
                             }
                         }
@@ -1002,7 +1059,112 @@ pub fn all_dependencies_and_features_filtered(
         features_with_deps.insert("default", (vec![""], vec![]));
     }
 
-    features_with_deps
+    Ok(features_with_deps)
+}
+
+pub fn dependency_is_runtime_candidate(dep: &Dependency, include_dev_dependencies: bool) -> bool {
+    use cargo::core::dependency::DepKind;
+
+    let kind_allowed = match dep.kind() {
+        DepKind::Normal => true,
+        DepKind::Development => include_dev_dependencies,
+        DepKind::Build => true,
+    };
+    if !kind_allowed {
+        return false;
+    }
+
+    if is_special_rustc_workspace_crate(dep.package_name().as_str()) {
+        takopack_warn!(
+            "Skipping special/internal Rust workspace dependency from runtime Requires: {}",
+            dep.package_name()
+        );
+        return false;
+    }
+
+    if matches!(dep.kind(), DepKind::Build | DepKind::Development)
+        && !dependency_matches_openruyi_linux_target(dep)
+    {
+        takopack_warn!(
+            "Skipping target-specific build/dev dependency not enabled for x86_64-unknown-linux-gnu Requires: {} {:?}",
+            dep.package_name(),
+            dep.platform().map(|platform| platform.to_string())
+        );
+        return false;
+    }
+
+    true
+}
+
+pub fn dependency_matches_openruyi_linux_target(dep: &Dependency) -> bool {
+    let Some(platform) = dep.platform() else {
+        return true;
+    };
+
+    let target_cfgs = [
+        "debug_assertions",
+        "panic = \"unwind\"",
+        "target_abi = \"\"",
+        "target_arch = \"x86_64\"",
+        "target_endian = \"little\"",
+        "target_env = \"gnu\"",
+        "target_family = \"unix\"",
+        "target_feature = \"fxsr\"",
+        "target_feature = \"sse\"",
+        "target_feature = \"sse2\"",
+        "target_has_atomic = \"16\"",
+        "target_has_atomic = \"32\"",
+        "target_has_atomic = \"64\"",
+        "target_has_atomic = \"8\"",
+        "target_has_atomic = \"ptr\"",
+        "target_os = \"linux\"",
+        "target_pointer_width = \"64\"",
+        "target_vendor = \"unknown\"",
+        "unix",
+    ]
+    .into_iter()
+    .map(|cfg| cfg.parse().expect("built-in Linux cfg should parse"))
+    .collect::<Vec<_>>();
+
+    platform.matches("x86_64-unknown-linux-gnu", &target_cfgs)
+}
+
+pub fn dependency_is_windows_only(dep: &Dependency) -> bool {
+    let Some(platform) = dep.platform() else {
+        return false;
+    };
+    let platform = platform.to_string().to_ascii_lowercase();
+    platform.contains("windows")
+        || platform.contains("win32")
+        || platform.contains("windows-msvc")
+        || platform.contains("windows-gnu")
+}
+
+pub fn is_special_rustc_workspace_crate(crate_name: &str) -> bool {
+    matches!(
+        crate_name.replace('_', "-").as_str(),
+        "rustc-std-workspace-core" | "rustc-std-workspace-alloc" | "rustc-std-workspace-std"
+    )
+}
+
+fn dependency_is_filtered_runtime_dependency(
+    manifest: &Manifest,
+    dep_name: &str,
+    include_dev_dependencies: bool,
+) -> bool {
+    manifest.dependencies().iter().any(|dep| {
+        dep.name_in_toml().as_str() == dep_name
+            && !dependency_is_runtime_candidate(dep, include_dev_dependencies)
+    })
+}
+
+fn dependency_is_dev_dependency(manifest: &Manifest, dep_name: &str) -> bool {
+    use cargo::core::dependency::DepKind;
+
+    manifest
+        .dependencies()
+        .iter()
+        .any(|dep| dep.kind() == DepKind::Development && dep.name_in_toml().as_str() == dep_name)
 }
 
 /// Calculate all feature-dependencies and external-dependencies of a given
@@ -1048,4 +1210,164 @@ fn transitive_deps_impl<'a>(
         );
     }
     Ok((all_features, all_deps))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        all_dependencies_and_features, dependency_is_runtime_candidate,
+        dependency_matches_openruyi_linux_target,
+    };
+    use cargo::core::{dependency::DepKind, Dependency, EitherManifest, SourceId};
+    use cargo::util::toml::read_manifest;
+    use cargo::GlobalContext;
+    use std::fs;
+
+    fn manifest_from_toml(toml: &str) -> cargo::core::Manifest {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("src")).unwrap();
+        fs::write(temp.path().join("src/lib.rs"), "pub fn marker() {}\n").unwrap();
+        let cargo_toml = temp.path().join("Cargo.toml");
+        fs::write(&cargo_toml, toml).unwrap();
+        let source_id = SourceId::for_path(temp.path()).unwrap();
+        match read_manifest(&cargo_toml, source_id, &GlobalContext::default().unwrap()).unwrap() {
+            EitherManifest::Real(manifest) => manifest,
+            _ => panic!("expected real manifest"),
+        }
+    }
+
+    fn dep_names(deps: &[cargo::core::Dependency]) -> Vec<String> {
+        let mut names = deps
+            .iter()
+            .map(|dep| dep.package_name().as_str().to_string())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    fn test_dep(name: &str, version: &str) -> Dependency {
+        let source_id = SourceId::for_path(&std::env::current_dir().unwrap()).unwrap();
+        Dependency::parse(name, Some(version), source_id).unwrap()
+    }
+
+    #[test]
+    fn feature_graph_includes_build_deps_and_target_normal_deps_but_excludes_dev_and_special_deps_by_default(
+    ) {
+        let manifest = manifest_from_toml(
+            r#"
+[package]
+name = "policy-fixture"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+normal = "1"
+optional-normal = { version = "1", optional = true }
+rustc-std-workspace-core = "1"
+
+[build-dependencies]
+cc = "1"
+optional-build = { version = "1", optional = true }
+
+[target.'cfg(target_os = "macos")'.build-dependencies]
+macos-build = "1"
+
+[target.'cfg(unix)'.build-dependencies]
+unix-build = "1"
+
+[dev-dependencies]
+proptest = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-win = "3"
+
+[target.'cfg(target_os = "redox")'.dependencies]
+libredox = "0.1"
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-dev = "1"
+
+[features]
+use-optional = ["dep:optional-normal"]
+use-build = ["dep:optional-build"]
+"#,
+        );
+
+        let features = all_dependencies_and_features(&manifest).unwrap();
+        let base_names = dep_names(&features.get("").unwrap().1);
+        assert_eq!(
+            vec!["cc", "libredox", "normal", "unix-build", "windows-win"],
+            base_names
+        );
+
+        let optional_names = dep_names(&features.get("use-optional").unwrap().1);
+        assert_eq!(vec!["optional-normal"], optional_names);
+
+        let optional_build_names = dep_names(&features.get("use-build").unwrap().1);
+        assert_eq!(vec!["optional-build"], optional_build_names);
+    }
+
+    #[test]
+    fn build_dependencies_are_provider_metadata_candidates_by_default() {
+        let manifest = manifest_from_toml(
+            r#"
+[package]
+name = "policy-fixture"
+version = "1.0.0"
+edition = "2021"
+
+[build-dependencies]
+cc = "1"
+"#,
+        );
+        let build_dep = manifest
+            .dependencies()
+            .iter()
+            .find(|dep| dep.kind() == DepKind::Build)
+            .unwrap();
+
+        assert!(dependency_is_runtime_candidate(build_dep, false));
+    }
+
+    #[test]
+    fn target_filter_matches_linux_cfg_expressions() {
+        let mut unix_dep = test_dep("unix-build", "1");
+        unix_dep.set_platform(Some("cfg(unix)".parse().unwrap()));
+
+        let mut macos_dep = test_dep("macos-build", "1");
+        macos_dep.set_platform(Some(r#"cfg(target_os = "macos")"#.parse().unwrap()));
+
+        let mut windows_dep = test_dep("windows-build", "1");
+        windows_dep.set_platform(Some("cfg(windows)".parse().unwrap()));
+
+        assert!(dependency_matches_openruyi_linux_target(&unix_dep));
+        assert!(!dependency_matches_openruyi_linux_target(&macos_dep));
+        assert!(!dependency_matches_openruyi_linux_target(&windows_dep));
+        assert!(dependency_is_runtime_candidate(&unix_dep, false));
+        assert!(dependency_is_runtime_candidate(&macos_dep, false));
+        assert!(dependency_is_runtime_candidate(&windows_dep, false));
+    }
+
+    #[test]
+    fn dev_dependencies_are_filtered_unless_explicitly_requested() {
+        let manifest = manifest_from_toml(
+            r#"
+[package]
+name = "policy-fixture"
+version = "1.0.0"
+edition = "2021"
+
+[dev-dependencies]
+proptest = "1"
+"#,
+        );
+        let dev_dep = manifest
+            .dependencies()
+            .iter()
+            .find(|dep| dep.kind() == DepKind::Development)
+            .unwrap();
+
+        assert!(!dependency_is_runtime_candidate(dev_dep, false));
+        assert!(dependency_is_runtime_candidate(dev_dep, true));
+    }
 }

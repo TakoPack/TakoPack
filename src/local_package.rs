@@ -1,17 +1,22 @@
 use anyhow::{Context, Result};
+use std::collections::BTreeSet;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use toml::Value;
 
 use crate::config::Config;
 use crate::crates::CrateInfo;
 use crate::package::PackageExecuteArgs;
+use crate::range_audit::{self, RangeCapabilityPolicy};
 use crate::takopack::{self, DebInfo};
+use crate::util::write_file_ensuring_dir;
 
 /// Process a local crate directory and generate spec file
 pub fn process_local_package(
     path: &Path,
     output_dir: Option<PathBuf>,
     finish_args: PackageExecuteArgs,
+    range_capability_policy: RangeCapabilityPolicy,
 ) -> Result<()> {
     // Canonicalize the path first to get absolute path
     let path_abs =
@@ -40,68 +45,10 @@ pub fn process_local_package(
 
     log::info!("Processing local crate from: {:?}", cargo_toml);
 
-    // Create a temporary directory with minimal crate structure
-    // TODO: Enable user to set crate structure.
-    // Or user changes toml at a crate root and then there is no need to crate.
     let temp_crate_dir =
         tempfile::tempdir().context("Failed to create temporary crate directory")?;
-
-    // Copy the Cargo.toml to the temp directory
-    let temp_cargo_toml = temp_crate_dir.path().join("Cargo.toml");
-    fs::copy(&cargo_toml, &temp_cargo_toml)
-        .with_context(|| format!("Failed to copy Cargo.toml to temp dir"))?;
-
-    // Copy the Cargo.toml to the temp directory
-    let temp_lib_rs = temp_crate_dir.path().join("lib.rs");
-    fs::write(&temp_lib_rs, "// Placeholder for spec generation\n")
-        .context("Failed to create lib.rs")?;
-
-    // Create minimal src/ structure so Cargo APIs can work
-    let src_dir = temp_crate_dir.path().join("src");
-    fs::create_dir(&src_dir)?;
-
-    // Create common source files to support various path configurations
-    let placeholder_content = "// Placeholder for spec generation\n";
-
-    // lib.rs - standard library entry point
-    fs::write(src_dir.join("lib.rs"), placeholder_content).context("Failed to create lib.rs")?;
-
-    // main.rs - standard binary entry point
-    fs::write(src_dir.join("main.rs"), placeholder_content).context("Failed to create main.rs")?;
-
-    // ffi.rs - common for FFI crates (like imagequant-sys)
-    fs::write(src_dir.join("ffi.rs"), placeholder_content).context("Failed to create ffi.rs")?;
-
-    // mod.rs - sometimes used as module root
-    fs::write(src_dir.join("mod.rs"), placeholder_content).context("Failed to create mod.rs")?;
-
-    // Create rust/ subdirectory for non-standard paths
-    let rust_dir = temp_crate_dir.path().join("rust");
-    fs::create_dir_all(&rust_dir).ok();
-
-    // rust/build.rs - non-standard build script location (e.g., pngquant)
-    fs::write(rust_dir.join("build.rs"), placeholder_content).ok();
-
-    // rust/bin.rs - non-standard binary location (e.g., pngquant)
-    fs::write(rust_dir.join("bin.rs"), placeholder_content).ok();
-
-    // rust/lib.rs - non-standard library location
-    fs::write(rust_dir.join("lib.rs"), placeholder_content).ok();
-
-    // Create a dummy README.md if referenced in Cargo.toml
-    let readme_path = temp_crate_dir.path().join("README.md");
-    fs::write(&readme_path, "# Placeholder README\n").context("Failed to create README.md")?;
-
-    // Standard build.rs location
-    let build_rs = temp_crate_dir.path().join("build.rs");
-    fs::write(&build_rs, "// Placeholder build script\n").context("Failed to create build.rs")?;
-
-    // Create dummy LICENSE files if needed
-    let license_mit = temp_crate_dir.path().join("LICENSE-MIT");
-    fs::write(&license_mit, "Placeholder MIT license\n").ok();
-
-    let license_apache = temp_crate_dir.path().join("LICENSE-APACHE");
-    fs::write(&license_apache, "Placeholder Apache license\n").ok();
+    let temp_cargo_toml =
+        materialize_manifest_backed_temp_crate(&cargo_toml, temp_crate_dir.path())?;
 
     log::info!(
         "Temporary crate structure created at: {:?}",
@@ -109,12 +56,195 @@ pub fn process_local_package(
     );
 
     // Now process this temporary complete crate with full takopack pipeline
-    return process_complete_crate(
+    process_complete_crate(
         temp_crate_dir.path(),
         &temp_cargo_toml,
         output_dir,
         finish_args,
-    );
+        range_capability_policy,
+    )
+}
+
+fn materialize_manifest_backed_temp_crate(cargo_toml: &Path, temp_dir: &Path) -> Result<PathBuf> {
+    let cargo_toml_content = fs::read_to_string(cargo_toml)
+        .with_context(|| format!("Failed to read Cargo.toml: {:?}", cargo_toml))?;
+    let manifest: Value = toml::from_str(&cargo_toml_content)
+        .with_context(|| format!("Failed to parse Cargo.toml: {:?}", cargo_toml))?;
+
+    let temp_cargo_toml = temp_dir.join("Cargo.toml");
+    fs::write(&temp_cargo_toml, cargo_toml_content).with_context(|| {
+        format!(
+            "Failed to write temporary Cargo.toml: {:?}",
+            temp_cargo_toml
+        )
+    })?;
+
+    if let Some(parent) = cargo_toml.parent() {
+        let config = parent.join("takopack.toml");
+        if config.exists() {
+            fs::copy(&config, temp_dir.join("takopack.toml"))
+                .with_context(|| format!("Failed to copy takopack.toml from {:?}", config))?;
+        }
+    }
+
+    materialize_manifest_paths(&manifest, temp_dir)?;
+    Ok(temp_cargo_toml)
+}
+
+fn materialize_manifest_paths(manifest: &Value, root: &Path) -> Result<()> {
+    let mut files = BTreeSet::new();
+    let mut explicit_targets = 0usize;
+    let mut has_lib_target = false;
+    let mut autolib = true;
+
+    if let Some(package) = manifest.get("package").and_then(Value::as_table) {
+        if let Some(value) = package.get("autolib").and_then(Value::as_bool) {
+            autolib = value;
+        }
+
+        if let Some(build) = package.get("build") {
+            match build {
+                Value::Boolean(false) => {}
+                Value::String(path) => {
+                    files.insert(path.clone());
+                }
+                _ => {
+                    files.insert("build.rs".to_string());
+                }
+            }
+        }
+
+        for key in ["readme", "license-file"] {
+            if let Some(path) = package.get(key).and_then(Value::as_str) {
+                files.insert(path.to_string());
+            }
+        }
+
+        if let Some(include) = package.get("include").and_then(Value::as_array) {
+            for item in include.iter().filter_map(Value::as_str) {
+                let item = normalize_package_root_relative_path(item);
+                if should_materialize_include(&item) {
+                    files.insert(item.trim_end_matches('/').to_string());
+                }
+            }
+        }
+    }
+
+    if let Some(lib) = manifest.get("lib").and_then(Value::as_table) {
+        explicit_targets += 1;
+        has_lib_target = true;
+        files.insert(
+            lib.get("path")
+                .and_then(Value::as_str)
+                .unwrap_or("src/lib.rs")
+                .to_string(),
+        );
+    }
+
+    for (key, default_dir) in [
+        ("bin", "src/bin"),
+        ("example", "examples"),
+        ("test", "tests"),
+        ("bench", "benches"),
+    ] {
+        if let Some(targets) = manifest.get(key).and_then(Value::as_array) {
+            for target in targets.iter().filter_map(Value::as_table) {
+                explicit_targets += 1;
+                let path = target
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| {
+                        target
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .map(|name| format!("{}/{}.rs", default_dir, name))
+                    })
+                    .unwrap_or_else(|| default_target_path(key).to_string());
+                files.insert(path);
+            }
+        }
+    }
+
+    if !has_lib_target && autolib {
+        files.insert("src/lib.rs".to_string());
+    }
+
+    if explicit_targets == 0 {
+        files.insert("src/lib.rs".to_string());
+    }
+
+    let files: Vec<_> = files
+        .iter()
+        .filter(|path| !has_materialized_child_path(path, &files))
+        .cloned()
+        .collect();
+
+    for path in files {
+        write_placeholder_file(root, &path)?;
+    }
+
+    Ok(())
+}
+
+fn default_target_path(kind: &str) -> &'static str {
+    match kind {
+        "bin" => "src/main.rs",
+        "example" => "examples/example.rs",
+        "test" => "tests/test.rs",
+        "bench" => "benches/bench.rs",
+        _ => "src/lib.rs",
+    }
+}
+
+fn should_materialize_include(path: &str) -> bool {
+    !path.starts_with('!')
+        && !path.contains('*')
+        && !path.contains('?')
+        && !path.contains('[')
+        && path != "Cargo.toml"
+}
+
+fn normalize_package_root_relative_path(path: &str) -> String {
+    path.trim_start_matches('/').to_string()
+}
+
+fn has_materialized_child_path(path: &str, files: &BTreeSet<String>) -> bool {
+    let path = Path::new(path);
+    files
+        .iter()
+        .any(|other| Path::new(other) != path && Path::new(other).starts_with(path))
+}
+
+fn write_placeholder_file(root: &Path, relative_path: &str) -> Result<()> {
+    let relative = safe_manifest_relative_path(relative_path)?;
+    let path = root.join(relative);
+    if path.exists() {
+        return Ok(());
+    }
+
+    let content = match path.extension().and_then(|ext| ext.to_str()) {
+        Some("rs") => "// Placeholder for takopack localpkg spec generation.\n",
+        Some("md") => "# Placeholder\n",
+        _ => "Placeholder for takopack localpkg spec generation.\n",
+    };
+    write_file_ensuring_dir(&path, content)
+}
+
+fn safe_manifest_relative_path(path: &str) -> Result<PathBuf> {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        anyhow::bail!("Cargo.toml path must be relative for localpkg: {:?}", path);
+    }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        anyhow::bail!("Cargo.toml path escapes the temporary crate: {:?}", path);
+    }
+    Ok(path.to_path_buf())
 }
 
 /// Process a complete crate directory (with src/) using full takopack pipeline
@@ -123,32 +253,8 @@ fn process_complete_crate(
     cargo_toml: &Path,
     output_dir: Option<PathBuf>,
     finish_args: PackageExecuteArgs,
+    range_capability_policy: RangeCapabilityPolicy,
 ) -> Result<()> {
-    if false {
-        // Backup the original Cargo.toml FIRST (before any cleaning or processing)
-        // Need to parse just to get name and version for backup filename
-        // TODO: may not necessary, keep the code temporarily.
-        let backup_content = fs::read_to_string(&cargo_toml)
-            .with_context(|| format!("Failed to read Cargo.toml: {:?}", cargo_toml))?;
-
-        let backup_manifest: toml::Value = toml::from_str(&backup_content)
-            .with_context(|| format!("Failed to parse Cargo.toml: {:?}", cargo_toml))?;
-
-        if let Some(package) = backup_manifest.get("package") {
-            if let (Some(name), Some(version)) = (
-                package.get("name").and_then(|n| n.as_str()),
-                package.get("version").and_then(|v| v.as_str()),
-            ) {
-                // Backup original under the takopack cargo_back patch/origin path
-                if let Err(e) =
-                    crate::util::backup_cargo_toml(&cargo_toml, name, version, Some("patch/origin"))
-                {
-                    log::warn!("Failed to backup original Cargo.toml: {:?}", e);
-                }
-            }
-        }
-    }
-
     // Load config if available
     let config_path = temp_crate_dir.join("takopack.toml");
     let (config_path, config) = if config_path.exists() {
@@ -171,20 +277,27 @@ fn process_complete_crate(
     // Create DebInfo
     let deb_info = DebInfo::new(&crate_info, env!("CARGO_PKG_VERSION"), config.semver_suffix);
 
-    // Calculate compatibility version following Rust semver rules
-    let compat_version = crate::util::calculate_compat_version(version);
+    let output_names = crate::util::rust_crate_output_names(crate_name, version);
 
-    // Determine output directory
-    let output_base = output_dir.unwrap_or_else(|| PathBuf::from("."));
-    let output_dirname = format!("rust-{}-{}", crate_name.replace('_', "-"), compat_version);
-    let final_output = output_base.join(&output_dirname);
+    if range_capability_policy != RangeCapabilityPolicy::Allow {
+        let warnings = range_audit::audit_cargo_dependencies(
+            crate_info.dependencies(),
+            Some(&output_names.directory),
+        );
+        if range_audit::emit_warnings(&warnings, range_capability_policy) {
+            anyhow::bail!("range capability audit failed (policy: error)");
+        }
+    }
+
+    // Determine final output package directory.
+    let final_output = crate::util::package_final_output_dir(output_dir.as_deref(), &output_names)?;
 
     fs::create_dir_all(&final_output)
         .with_context(|| format!("Failed to create output directory: {:?}", final_output))?;
 
     // Create a temporary directory for takopack processing
     let tempdir =
-        tempfile::tempdir_in(&temp_crate_dir).context("Failed to create temporary directory")?;
+        tempfile::tempdir_in(temp_crate_dir).context("Failed to create temporary directory")?;
 
     log::info!("Tempdir created at: {:?}", tempdir.path());
     log::info!("Preparing takopack folder");
@@ -195,7 +308,7 @@ fn process_complete_crate(
         &deb_info,
         config_path.as_deref(),
         &config,
-        &temp_crate_dir,
+        temp_crate_dir,
         &tempdir,
         finish_args.changelog_ready,
         finish_args.copyright_guess_harder,
@@ -215,18 +328,15 @@ fn process_complete_crate(
     log::info!("Takopack dir exists: {}", takopack_dir.exists());
 
     // Copy spec file to output directory
-    let spec_filename = format!("rust-{}.spec", crate_name.replace('_', "-"));
-    let source_spec = takopack_dir.join(&spec_filename);
-    let final_spec = final_output.join(&spec_filename);
+    let source_spec = takopack_dir.join(&output_names.spec_file);
+    let final_spec = final_output.join(&output_names.spec_file);
 
     // List files in takopack dir for debugging
     log::debug!("Listing files in takopack dir: {:?}", takopack_dir);
     match fs::read_dir(&takopack_dir) {
         Ok(entries) => {
-            for entry in entries {
-                if let Ok(entry) = entry {
-                    log::debug!("  - {:?}", entry.file_name());
-                }
+            for entry in entries.flatten() {
+                log::debug!("  - {:?}", entry.file_name());
             }
         }
         Err(e) => {
@@ -237,6 +347,7 @@ fn process_complete_crate(
     if source_spec.exists() {
         fs::copy(&source_spec, &final_spec)
             .with_context(|| format!("Failed to copy spec file to: {:?}", final_spec))?;
+        crate::util::copy_normalized_cargo_toml_to_dir(temp_crate_dir, &final_output)?;
 
         log::info!("Spec file saved to: {}", final_spec.display());
         println!("Spec file: {}", final_spec.display());
@@ -245,4 +356,212 @@ fn process_complete_crate(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{materialize_manifest_backed_temp_crate, process_local_package};
+    use crate::package::PackageExecuteArgs;
+    use crate::range_audit::RangeCapabilityPolicy;
+    use crate::util::rust_crate_output_names;
+    use semver::Version;
+    use std::fs;
+
+    #[test]
+    fn localpkg_materializes_declared_manifest_paths() {
+        let source = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            source.path().join("Cargo.toml"),
+            r#"
+[package]
+name = "shape"
+version = "1.2.3"
+edition = "2021"
+build = "build/main.rs"
+readme = "docs/README.md"
+license-file = "licenses/LICENSE.txt"
+include = ["NOTICE"]
+
+[lib]
+path = "src/shape/lib.rs"
+
+[[bin]]
+name = "shape-cli"
+path = "cli/main.rs"
+
+[[example]]
+name = "demo"
+"#,
+        )
+        .unwrap();
+        fs::write(source.path().join("takopack.toml"), "[source]\n").unwrap();
+
+        materialize_manifest_backed_temp_crate(&source.path().join("Cargo.toml"), temp.path())
+            .unwrap();
+
+        for path in [
+            "Cargo.toml",
+            "takopack.toml",
+            "build/main.rs",
+            "docs/README.md",
+            "licenses/LICENSE.txt",
+            "NOTICE",
+            "src/shape/lib.rs",
+            "cli/main.rs",
+            "examples/demo.rs",
+        ] {
+            assert!(temp.path().join(path).exists(), "missing {path}");
+        }
+    }
+
+    #[test]
+    fn localpkg_adds_default_lib_for_manifest_without_targets() {
+        let source = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            source.path().join("Cargo.toml"),
+            r#"
+[package]
+name = "minimal"
+version = "0.1.0"
+edition = "2021"
+"#,
+        )
+        .unwrap();
+
+        materialize_manifest_backed_temp_crate(&source.path().join("Cargo.toml"), temp.path())
+            .unwrap();
+
+        assert!(temp.path().join("src/lib.rs").exists());
+    }
+
+    #[test]
+    fn localpkg_materializes_root_relative_includes() {
+        let source = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            source.path().join("Cargo.toml"),
+            r#"
+[package]
+name = "rooted"
+version = "0.1.0"
+edition = "2021"
+include = [
+    "/Cargo.toml",
+    "/CHANGELOG.md",
+    "/src",
+]
+
+[lib]
+path = "src/lib.rs"
+"#,
+        )
+        .unwrap();
+
+        materialize_manifest_backed_temp_crate(&source.path().join("Cargo.toml"), temp.path())
+            .unwrap();
+
+        assert!(temp.path().join("CHANGELOG.md").exists());
+        assert!(temp.path().join("src").is_dir());
+        assert!(temp.path().join("src/lib.rs").exists());
+    }
+
+    #[test]
+    fn localpkg_does_not_materialize_parent_include_as_file() {
+        let source = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            source.path().join("Cargo.toml"),
+            r#"
+[package]
+name = "benchy"
+version = "0.1.0"
+edition = "2021"
+include = ["benches"]
+
+[lib]
+path = "src/lib.rs"
+
+[[bench]]
+name = "mod"
+path = "benches/mod.rs"
+"#,
+        )
+        .unwrap();
+
+        materialize_manifest_backed_temp_crate(&source.path().join("Cargo.toml"), temp.path())
+            .unwrap();
+
+        assert!(temp.path().join("benches").is_dir());
+        assert!(temp.path().join("benches/mod.rs").exists());
+    }
+
+    #[test]
+    fn localpkg_materializes_auto_lib_with_other_targets() {
+        let source = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            source.path().join("Cargo.toml"),
+            r#"
+[package]
+name = "auto_lib"
+version = "0.1.0"
+edition = "2021"
+
+[[test]]
+name = "tests"
+
+[[bench]]
+name = "benchmarks"
+"#,
+        )
+        .unwrap();
+
+        materialize_manifest_backed_temp_crate(&source.path().join("Cargo.toml"), temp.path())
+            .unwrap();
+
+        assert!(temp.path().join("src/lib.rs").exists());
+        assert!(temp.path().join("tests/tests.rs").exists());
+        assert!(temp.path().join("benches/benchmarks.rs").exists());
+    }
+
+    #[test]
+    fn localpkg_generates_spec_from_manifest_only_crate() {
+        let source = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        fs::write(
+            source.path().join("Cargo.toml"),
+            r#"
+[package]
+name = "localpkg_smoke"
+version = "0.1.0"
+edition = "2021"
+"#,
+        )
+        .unwrap();
+
+        let finish = PackageExecuteArgs {
+            changelog_ready: false,
+            copyright_guess_harder: false,
+            no_overlay_write_back: false,
+            lockfile_deps: None,
+        };
+
+        let output_names =
+            rust_crate_output_names("localpkg_smoke", &Version::parse("0.1.0").unwrap());
+        let package_dir = output.path().join("explicit-final-package-dir");
+
+        process_local_package(
+            source.path(),
+            Some(package_dir.clone()),
+            finish,
+            RangeCapabilityPolicy::Allow,
+        )
+        .unwrap();
+
+        assert!(package_dir.join(&output_names.spec_file).exists());
+        assert!(package_dir.join("Cargo.toml").exists());
+        assert!(!output.path().join(&output_names.directory).exists());
+    }
 }

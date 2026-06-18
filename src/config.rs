@@ -1,3 +1,4 @@
+use anyhow::Context;
 use serde::de::IgnoredAny;
 use serde::Deserialize;
 use toml;
@@ -7,7 +8,7 @@ use crate::errors::*;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -56,6 +57,7 @@ pub struct SourceOverride {
 }
 
 impl SourceOverride {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         section: Option<String>,
         policy: Option<String>,
@@ -83,6 +85,7 @@ impl SourceOverride {
         }
     }
 }
+
 #[derive(Deserialize, Debug, Clone, Default)]
 pub struct PackageOverride {
     section: Option<String>,
@@ -206,8 +209,6 @@ impl Config {
         self.requires_root.as_ref()
     }
 
-    // Source shortcuts
-
     pub fn section(&self) -> Option<&str> {
         Some(self.source.as_ref()?.section.as_ref()?)
     }
@@ -247,8 +248,6 @@ impl Config {
     pub fn skip_nocheck(&self) -> Option<bool> {
         self.source.as_ref()?.skip_nocheck
     }
-
-    // Packages accessors
 
     pub fn configured_packages(&'_ self) -> impl Iterator<Item = PackageKey<'_>> {
         self.packages.keys().flat_map(|k| PackageKey::from_key(k))
@@ -383,6 +382,94 @@ impl<'a> PackageKey<'a> {
             Extra(package) => format!("extra+{}", package).into(),
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct TakopackToml {
+    pub ruyispec: Option<RuyispecConfig>,
+    pub registry: Option<RegistryConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct RuyispecConfig {
+    pub local_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct RegistryConfig {
+    pub local_path: Option<PathBuf>,
+}
+
+pub fn resolve_ruyispec_dir(explicit: Option<&Path>, use_config: bool) -> Result<PathBuf> {
+    if let Some(path) = explicit {
+        return require_directory(path, "explicit ruyispec path");
+    }
+    if !use_config {
+        takopack_bail!("ruyispec directory is required unless --ruyispec is used");
+    }
+
+    let (config_path, config) = load_takopack_toml()?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "missing takopack.toml; create one with [ruyispec].local_path or pass an explicit path"
+        )
+    })?;
+    let local_path = config
+        .ruyispec
+        .and_then(|ruyispec| ruyispec.local_path)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} does not define [ruyispec].local_path",
+                config_path.display()
+            )
+        })?;
+    let local_path = if local_path.is_absolute() {
+        local_path
+    } else {
+        config_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(local_path)
+    };
+
+    require_directory(&local_path, "ruyispec.local_path")
+}
+
+pub fn ruyispec_package_root(ruyispec_dir: &Path) -> PathBuf {
+    let specs_dir = ruyispec_dir.join("SPECS");
+    if specs_dir.is_dir() {
+        specs_dir
+    } else {
+        ruyispec_dir.to_path_buf()
+    }
+}
+
+pub(crate) fn load_takopack_toml() -> Result<Option<(PathBuf, TakopackToml)>> {
+    let Some(path) = find_takopack_toml() else {
+        return Ok(None);
+    };
+    let content =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let config =
+        toml::from_str(&content).with_context(|| format!("failed to parse {}", path.display()))?;
+    Ok(Some((path, config)))
+}
+
+fn find_takopack_toml() -> Option<PathBuf> {
+    let current = PathBuf::from("takopack.toml");
+    if current.is_file() {
+        return Some(current);
+    }
+
+    dirs::config_dir()
+        .map(|dir| dir.join("takopack").join("takopack.toml"))
+        .filter(|path| path.is_file())
+}
+
+fn require_directory(path: &Path, label: &str) -> Result<PathBuf> {
+    if !path.is_dir() {
+        takopack_bail!("{} is not a directory: {}", label, path.display());
+    }
+    Ok(path.to_path_buf())
 }
 
 pub fn testing_ignore_debpolv() -> bool {
