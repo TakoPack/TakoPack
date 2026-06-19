@@ -100,6 +100,39 @@ pub enum CargoOpt {
         #[arg(long, value_enum, default_value_t = RangeCapabilityPolicy::Warn)]
         range_capability_policy: RangeCapabilityPolicy,
     },
+    /// Sync Rust crate providers from ruyispec to local Cargo directory registry
+    #[command(name = "registry-sync")]
+    RegistrySync {
+        /// Only print the sync plan without making changes
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Number of concurrent crate downloads/extractions
+        #[arg(short = 'j', long, default_value_t = 8, value_name = "N")]
+        jobs: usize,
+    },
+    /// Check whether a single crate can resolve against the local TakoPack registry
+    #[command(name = "resolve-check")]
+    ResolveCheck {
+        /// Path to a directory containing Cargo.toml, or a Cargo.toml file
+        #[arg(value_name = "PATH")]
+        path: std::path::PathBuf,
+
+        /// Local Cargo directory registry. Overrides [registry].local_path in takopack.toml
+        #[arg(long, value_name = "DIR")]
+        registry: Option<std::path::PathBuf>,
+    },
+    /// Generate BuildRequires from a single-crate dynamic local-registry resolve
+    #[command(name = "buildreqs")]
+    BuildReqs {
+        /// Path to a directory containing Cargo.toml, or a Cargo.toml file
+        #[arg(value_name = "PATH")]
+        path: std::path::PathBuf,
+
+        /// Local Cargo directory registry. Overrides [registry].local_path in takopack.toml
+        #[arg(long, value_name = "DIR")]
+        registry: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]

@@ -434,6 +434,27 @@ pub fn resolve_ruyispec_dir(explicit: Option<&Path>, use_config: bool) -> Result
     require_directory(&local_path, "ruyispec.local_path")
 }
 
+pub fn resolve_registry_dir(explicit: Option<&Path>) -> Result<PathBuf> {
+    if let Some(path) = explicit {
+        return Ok(path.to_path_buf());
+    }
+
+    if let Some((config_path, config)) = load_takopack_toml()? {
+        if let Some(local_path) = config.registry.and_then(|registry| registry.local_path) {
+            return Ok(resolve_config_relative_path(&config_path, local_path));
+        }
+    }
+
+    default_registry_dir()
+}
+
+pub fn default_registry_dir() -> Result<PathBuf> {
+    let data_dir = dirs::data_dir().ok_or_else(|| {
+        anyhow::anyhow!("cannot determine XDG_DATA_HOME / home directory for default registry path")
+    })?;
+    Ok(data_dir.join("takopack").join("cargo-registry"))
+}
+
 pub fn ruyispec_package_root(ruyispec_dir: &Path) -> PathBuf {
     let specs_dir = ruyispec_dir.join("SPECS");
     if specs_dir.is_dir() {
@@ -463,6 +484,17 @@ fn find_takopack_toml() -> Option<PathBuf> {
     dirs::config_dir()
         .map(|dir| dir.join("takopack").join("takopack.toml"))
         .filter(|path| path.is_file())
+}
+
+fn resolve_config_relative_path(config_path: &Path, path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        config_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(path)
+    }
 }
 
 fn require_directory(path: &Path, label: &str) -> Result<PathBuf> {

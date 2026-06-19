@@ -65,7 +65,10 @@ pub fn process_local_package(
     )
 }
 
-fn materialize_manifest_backed_temp_crate(cargo_toml: &Path, temp_dir: &Path) -> Result<PathBuf> {
+pub(crate) fn materialize_manifest_backed_temp_crate(
+    cargo_toml: &Path,
+    temp_dir: &Path,
+) -> Result<PathBuf> {
     let cargo_toml_content = fs::read_to_string(cargo_toml)
         .with_context(|| format!("Failed to read Cargo.toml: {:?}", cargo_toml))?;
     let manifest: Value = toml::from_str(&cargo_toml_content)
@@ -234,7 +237,7 @@ fn write_placeholder_file(root: &Path, relative_path: &str) -> Result<()> {
 fn safe_manifest_relative_path(path: &str) -> Result<PathBuf> {
     let path = Path::new(path);
     if path.is_absolute() {
-        anyhow::bail!("Cargo.toml path must be relative for localpkg: {:?}", path);
+        anyhow::bail!("Cargo.toml path must be relative: {:?}", path);
     }
     if path.components().any(|component| {
         matches!(

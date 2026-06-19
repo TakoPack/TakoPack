@@ -147,6 +147,18 @@ fn real_main() -> Result<i32> {
                     )?;
                     Ok(0)
                 }
+                CargoOpt::RegistrySync { dry_run, jobs } => {
+                    log::info!("starting registry sync");
+                    takopack::registry_sync::run_registry_sync(dry_run, jobs)
+                }
+                CargoOpt::ResolveCheck { path, registry } => {
+                    log::info!("starting resolve check");
+                    takopack::resolve_check::run_resolve_check(&path, registry.as_deref())
+                }
+                CargoOpt::BuildReqs { path, registry } => {
+                    log::info!("generating dynamic BuildRequires");
+                    takopack::dynamic_buildreqs::run_buildreqs(&path, registry.as_deref())
+                }
             }
         }
         Opt::Py(py_opt) => match py_opt {
