@@ -1,5 +1,11 @@
 use std::fmt::{self, Write};
 
+const SPDX_HEADER: &str = r#"# SPDX-FileCopyrightText: (C) 2026 Institute of Software, Chinese Academy of Sciences (ISCAS)
+# SPDX-FileCopyrightText: (C) 2026 openRuyi Project Contributors
+#
+# SPDX-License-Identifier: MulanPSL-2.0
+"#;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CapabilityVersion {
     None,
@@ -131,6 +137,8 @@ pub fn render_crate_requires(req: &CrateRequirement) -> String {
 }
 
 pub fn render_header_section<W: Write>(out: &mut W, source: &SpecSource) -> fmt::Result {
+    write!(out, "{}", SPDX_HEADER)?;
+    writeln!(out)?;
     writeln!(out, "%global crate_name {}", source.crate_name)?;
     writeln!(out, "%global full_version {}", source.full_version)?;
     writeln!(out, "%global pkgname {}", source.pkgname)?;

@@ -7,6 +7,9 @@ TakoPack 是一个用于将各种语言生态系统的软件（目前支持 Rust
 - **单包打包**: 为单个 crate 生成 RPM spec 文件
 - **本地打包**: 直接从本地 Cargo.toml 生成 spec 文件
 - **Python 打包**: 为单个 Python 包生成 RPM spec 文件
+- **Registry 同步**: 从 ruyispec 同步 crate 到本地 registry，支持增量更新和并发下载
+- **依赖检查**: 验证 crate 能否从本地 registry 解析依赖
+- **BuildRequires 生成**: 自动生成 RPM 的 BuildRequires 声明
 
 ## 安装
 
@@ -113,6 +116,160 @@ takopack cargo localpkg ./Cargo.toml -o specs/
 - 适合本地开发和测试
 - 支持路径为目录或直接指向 Cargo.toml 文件
 - 自动处理本地依赖关系
+
+#### 3. registry-sync - 同步 Registry
+
+从 ruyispec 仓库同步 Rust crate 到本地 Cargo registry 目录。用于构建本地离线 registry，供 `resolve-check` 和 `buildreqs` 使用。
+
+```bash
+# 同步（使用配置文件中的路径）
+takopack cargo registry-sync
+
+# 试运行，只显示计划，不实际修改
+takopack cargo registry-sync --dry-run
+
+# 指定并发数（默认 8）
+takopack cargo registry-sync -j 4
+```
+
+**参数**:
+- `--dry-run`: 只打印同步计划，不修改文件
+- `-j, --jobs N`: 并发下载/解压的线程数，默认 8
+
+**输出示例**:
+```
+Registry sync
+  ruyispec: /path/to/openruyi-repo
+  registry: /path/to/cargo-registry
+  jobs: 8
+
+Summary:
+  add=5
+  update=2
+  remove=0
+  skip=100
+  warnings=0
+  sync_errors=0
+```
+
+**特点**:
+- 增量同步：通过 SHA-256 hash 对比，只更新变化的 crate
+- 并发下载：多线程并行下载，提高效率
+- 安全机制：marker 文件防止误操作非托管目录
+- 原子更新：先写临时目录，再 rename 替换
+
+#### 4. resolve-check - 依赖解析检查
+
+验证单个 Cargo crate 能否使用本地 registry 完成依赖解析。用于检查本地 registry 的完整性。
+
+```bash
+# 检查当前目录的 crate
+takopack cargo resolve-check .
+
+# 检查指定路径
+takopack cargo resolve-check ./path/to/crate
+
+# 指定 registry 目录（覆盖配置文件）
+takopack cargo resolve-check . --registry /path/to/registry
+```
+
+注：请使用此命令来检查仓库使用 `crate` 构建的应用包的依赖是否满足。
+
+**输出示例**:
+```
+Resolve check
+  manifest: /path/to/crate/Cargo.toml
+  registry: /path/to/cargo-registry
+
+Result: ok
+```
+
+**返回值**:
+- `0`: 解析成功，所有依赖都在本地 registry 中
+- `1`: 解析失败，有依赖缺失
+
+#### 5. buildreqs - 生成 BuildRequires
+
+从 Cargo 依赖解析结果自动生成 RPM 的 BuildRequires 声明。
+
+```bash
+# 为当前目录的 crate 生成 BuildRequires
+takopack cargo buildreqs .
+
+# 为指定路径生成
+takopack cargo buildreqs ./path/to/crate
+
+# 指定 registry 目录
+takopack cargo buildreqs . --registry /path/to/registry
+```
+
+**输出示例**:
+```
+BuildRequires:  crate(serde-1) >= 1.0.210
+BuildRequires:  crate(tokio-1) >= 1.40.0
+BuildRequires:  crate(anyhow-1) >= 1.0.86
+```
+
+**特点**:
+- 自动过滤：只输出 registry 来源的依赖，排除本地路径依赖
+- 版本兼容：使用 compat version 规则（如 `1.x.y` → `1`）
+- 去重排序：自动去重并按字母顺序排列
+
+注：目前输出的构建依赖比较冗长，可以考虑后续结合 `feature` 进行缩减。
+
+## 配置文件
+
+TakoPack 使用 `takopack.toml` 配置文件来设置默认路径。
+
+### 配置文件位置
+
+按以下顺序查找，找到第一个即停止：
+
+1. `./takopack.toml`（当前工作目录）
+2. `~/.config/takopack/takopack.toml`（Linux）
+3. `~/Library/Application Support/takopack/takopack.toml`（macOS）
+4. `C:\Users\{user}\AppData\Roaming\takopack\takopack.toml`（Windows）
+
+### 配置项
+
+```toml
+[ruyispec]
+# ruyispec 仓库路径，registry-sync 命令需要
+local_path = "/path/to/openruyi-repo"
+
+[registry]
+# 本地 Cargo registry 目录
+# 可选，默认为 $XDG_DATA_HOME/takopack/cargo-registry
+local_path = "/path/to/cargo-registry"
+```
+
+### 相对路径
+
+`local_path` 支持相对路径，相对于配置文件所在目录：
+
+```toml
+# 配置文件: /home/user/project/takopack.toml
+[ruyispec]
+local_path = "../openruyi-repo"  # 实际路径: /home/user/openruyi-repo
+```
+
+### 默认 registry 路径
+
+如果未配置 `[registry].local_path`，使用以下默认路径：
+
+- Linux: `~/.local/share/takopack/cargo-registry`
+- macOS: `~/Library/Application Support/takopack/cargo-registry`
+- Windows: `C:\Users\{user}\AppData\Roaming\takopack\cargo-registry`
+
+### 配置示例
+
+```toml
+[ruyispec]
+local_path = "/root/git/openruyi-repo"
+
+[registry]
+local_path = "/root/git/takopack-cargo-registry"
+```
 
 ## 命令别名
 
