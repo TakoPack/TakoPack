@@ -14,7 +14,7 @@ cargo = "0.97"
 cargo-util = "0.2.30"
 cargo-util-schemas = "0.14"
 cargo-util-terminal = "0.1"
-clap = { version = "4.5", features = ["cargo", "derive", "wrap_help"] }
+clap = { version = "4.5" }
 clap_mangen = { version = "0.2.29" }
 dirs = "5.0"
 env_logger = "0.11"

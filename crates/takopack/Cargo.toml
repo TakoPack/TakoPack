@@ -32,7 +32,7 @@ serde_derive = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 takopack-core = { workspace = true }
-takopack-python = { workspace = true }
+takopack-python = { workspace = true, features = ["cli", "render"] }
 takopack-rust = { workspace = true }
 tar = { workspace = true }
 tempfile = { workspace = true }

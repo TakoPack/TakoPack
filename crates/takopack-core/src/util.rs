@@ -70,13 +70,15 @@ pub fn rust_crate_output_names(crate_name: &str, version: &Version) -> RustCrate
     }
 }
 
-pub fn write_file_ensuring_dir(path: &Path, contents: impl AsRef<[u8]>) -> Result<()> {
+pub fn write_file_ensuring_dir(
+    path: &Path,
+    contents: impl AsRef<[u8]>,
+) -> Result<(), std::io::Error> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create directory for {:?}", path))?;
+        fs::create_dir_all(parent)?;
     }
 
-    fs::write(path, contents).with_context(|| format!("Failed to write {:?}", path))
+    fs::write(path, contents)
 }
 
 pub fn resolve_output_dir(path: &Path) -> Result<PathBuf> {

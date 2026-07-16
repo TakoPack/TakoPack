@@ -1,166 +1,52 @@
-use std::ffi::OsStr;
-use std::fs;
-use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+//! Render to RPM Spec.
 
-use anyhow::{Context, Result};
-use flate2::read::GzDecoder;
-use regex::Regex;
-use serde_json::Value;
-use sha2::{Digest, Sha256};
-use tar::Archive;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
-use takopack_core::util::write_file_ensuring_dir;
+use crate::pypi::{Pypi, package::PypiInfo};
 
-const FALLBACK_LICENSE: &str = "LicenseRef-Unknown-Please-Check-Manual";
+impl<'a> Pypi<'a> {
+    pub fn render(&self, package_dir: &Path) -> Result<(), std::io::Error> {
+        let srcname = &self.name().trim().to_lowercase().replace(['_', '.'], "-");
 
-fn re_license_ops_with_capture() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    // Treat textual operators only when separated by whitespace, so SPDX IDs
-    // like GPL-2.0-or-later are not split into broken tokens.
-    RE.get_or_init(|| Regex::new("(?i)(?:\\s*(?:/|\\||,)\\s*|\\s+(?:or|and)\\s+)").unwrap())
+        let extracted_root = self.extract_tar_gz()?;
+        let mut meta = SpecMeta {
+            summary: self.info().summary.clone(),
+            license: resolve_license_from_info(self.info()),
+            url: preferred_url_from_info(self.info())
+                .or_else(|| self.info().package_url.clone())
+                .unwrap_or_else(|| format!("https://pypi.org/project/{}/", self.name())),
+            vcs: String::new(),
+            description: self.info().description.clone(),
+        };
+
+        enrich_meta_from_pyproject(&extracted_root, &mut meta);
+        enrich_meta_from_pkg_info(&extracted_root, &mut meta);
+        enrich_meta_from_license_files(&extracted_root, &mut meta);
+        finalize_meta(&mut meta, self.name());
+
+        let pypi_name = filename_dist_name(&self.release_file().filename, self.version())
+            .unwrap_or_else(|| self.name().to_string());
+        let spec_path = package_dir.join(format!("python-{}.spec", srcname));
+        let spec_content = render_spec(
+            &srcname,
+            &pypi_name,
+            self.version(),
+            &self.release_file().filename,
+            &self.release_file().digests.sha256,
+            &meta,
+        );
+        takopack_core::util::write_file_ensuring_dir(&spec_path, spec_content.as_bytes())?;
+
+        println!("Generated spec file: {}", spec_path.display());
+        Ok(())
+    }
 }
 
-fn re_spdx_like_core() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^[A-Za-z0-9.+-]+(?:\s+WITH\s+[A-Za-z0-9.+-]+)?$").unwrap())
-}
-
-fn re_md_link() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\[([^\]]+)\]\([^\)]+\)").unwrap())
-}
-
-fn re_html_tag() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"<[^>]+>").unwrap())
-}
-
-pub fn process_python_package(
-    package_name: &str,
-    version: Option<&str>,
-    output_dir: Option<PathBuf>,
-) -> Result<()> {
-    // Always create the target folder first so both normal and fallback flows
-    // can write a deterministic spec path.
-    let srcname = normalize_srcname(package_name);
-    let output_base = output_dir.unwrap_or_else(|| PathBuf::from("."));
-    let package_dir = output_base.join(format!("python-{}", srcname));
-    fs::create_dir_all(&package_dir).with_context(|| {
-        format!(
-            "failed to create output directory for python package: {}",
-            package_dir.display()
-        )
-    })?;
-
-    // If the package does not exist on PyPI, generate an editable skeleton
-    // instead of failing the whole run.
-    let pypi_json = match fetch_pypi_json(package_name) {
-        Ok(v) => v,
-        Err(e) => {
-            let skeleton_version = version
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .unwrap_or("0.0.0");
-            let spec_path = package_dir.join(format!("python-{}.spec", srcname));
-            let spec_content = render_skeleton_spec(&srcname, skeleton_version, package_name, &e);
-            write_file_ensuring_dir(&spec_path, spec_content.as_bytes())?;
-            println!(
-                "[WARN] PyPI metadata not found for {}. Generated skeleton spec: {}",
-                package_name,
-                spec_path.display()
-            );
-            return Ok(());
-        }
-    };
-    let info = pypi_json
-        .get("info")
-        .and_then(Value::as_object)
-        .context("invalid PyPI metadata: missing info object")?;
-
-    let resolved_version = match version {
-        Some(v) if !v.trim().is_empty() => v.trim().to_string(),
-        _ => info
-            .get("version")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .context("failed to resolve latest version from PyPI metadata")?,
-    };
-
-    // Some versions publish wheels only; in that case we still emit a skeleton
-    // because spec generation depends on source archives.
-    let release_file = match pick_release_file(&pypi_json, &resolved_version) {
-        Ok(v) => v,
-        Err(e) => {
-            let spec_path = package_dir.join(format!("python-{}.spec", srcname));
-            let spec_content = render_skeleton_spec(&srcname, &resolved_version, package_name, &e);
-            write_file_ensuring_dir(&spec_path, spec_content.as_bytes())?;
-            println!(
-                "[WARN] No source archive available for {}@{}. Generated skeleton spec: {}",
-                package_name,
-                resolved_version,
-                spec_path.display()
-            );
-            return Ok(());
-        }
-    };
-    let temp_dir = tempfile::Builder::new()
-        .prefix("takopack-py-")
-        .tempdir_in(".")
-        .context("failed to create temporary directory")?;
-    let archive_path = temp_dir.path().join(&release_file.filename);
-    download_file(&release_file.url, &archive_path)?;
-    verify_sha256(&archive_path, &release_file.sha256)?;
-
-    let extract_dir = temp_dir.path().join("extract");
-    fs::create_dir_all(&extract_dir)?;
-    extract_tar_gz(&archive_path, &extract_dir)?;
-
-    let extracted_root = detect_extract_root(&extract_dir)?;
-    let mut meta = SpecMeta {
-        summary: info
-            .get("summary")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        license: resolve_license_from_info(info),
-        url: preferred_url_from_info(info)
-            .or_else(|| {
-                info.get("package_url")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| format!("https://pypi.org/project/{}/", package_name)),
-        vcs: String::new(),
-        description: info
-            .get("description")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-    };
-
-    enrich_meta_from_pyproject(&extracted_root, &mut meta);
-    enrich_meta_from_pkg_info(&extracted_root, &mut meta);
-    enrich_meta_from_license_files(&extracted_root, &mut meta);
-    finalize_meta(&mut meta, package_name);
-
-    let pypi_name = filename_dist_name(&release_file.filename, &resolved_version)
-        .unwrap_or_else(|| package_name.to_string());
-    let spec_path = package_dir.join(format!("python-{}.spec", srcname));
-    let spec_content = render_spec(
-        &srcname,
-        &pypi_name,
-        &resolved_version,
-        &release_file.filename,
-        &release_file.sha256,
-        &meta,
-    );
-    write_file_ensuring_dir(&spec_path, spec_content.as_bytes())?;
-
-    println!("Generated spec file: {}", spec_path.display());
-    Ok(())
-}
+#[derive(Debug)]
+pub enum RenderError {}
 
 struct SpecMeta {
     summary: String,
@@ -170,217 +56,10 @@ struct SpecMeta {
     description: String,
 }
 
-struct ReleaseFile {
-    filename: String,
-    url: String,
-    sha256: String,
-    upload_time: String,
-}
+fn preferred_url_from_info(info: &PypiInfo) -> Option<String> {
+    use serde_json::Value;
 
-fn fetch_pypi_json(package_name: &str) -> Result<Value> {
-    let url = format!("https://pypi.org/pypi/{}/json", package_name);
-    let response = ureq::get(&url)
-        .call()
-        .with_context(|| "failed to query PyPI metadata")?;
-    let mut reader = response.into_reader();
-    let mut body = Vec::new();
-    reader
-        .read_to_end(&mut body)
-        .with_context(|| "failed to read PyPI metadata response")?;
-    let json: Value =
-        serde_json::from_slice(&body).context("failed to parse PyPI JSON metadata")?;
-    Ok(json)
-}
-
-fn pick_release_file(pypi_json: &Value, version: &str) -> Result<ReleaseFile> {
-    let releases = pypi_json
-        .get("releases")
-        .and_then(Value::as_object)
-        .context("invalid PyPI metadata: missing releases object")?;
-    let files = releases
-        .get(version)
-        .and_then(Value::as_array)
-        .with_context(|| format!("version {} not found on PyPI", version))?;
-
-    // Prefer .tar.gz over .tgz and, for equal formats, pick the latest upload.
-    let mut selected: Option<ReleaseFile> = None;
-    let mut selected_rank: i32 = -1;
-    for file in files {
-        let obj = match file.as_object() {
-            Some(v) => v,
-            None => continue,
-        };
-        if obj
-            .get("packagetype")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            != "sdist"
-        {
-            continue;
-        }
-        if obj.get("yanked").and_then(Value::as_bool).unwrap_or(false) {
-            continue;
-        }
-
-        let filename = match obj.get("filename").and_then(Value::as_str) {
-            Some(v) => v.to_string(),
-            None => continue,
-        };
-        let rank = if filename.ends_with(".tar.gz") {
-            2
-        } else if filename.ends_with(".tgz") {
-            1
-        } else {
-            0
-        };
-        if rank <= 0 {
-            continue;
-        }
-
-        let candidate = ReleaseFile {
-            filename,
-            url: obj
-                .get("url")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            sha256: obj
-                .get("digests")
-                .and_then(Value::as_object)
-                .and_then(|dig| dig.get("sha256"))
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            upload_time: obj
-                .get("upload_time_iso_8601")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-        };
-        if candidate.url.is_empty() || candidate.sha256.is_empty() {
-            continue;
-        }
-
-        let should_replace = match &selected {
-            None => true,
-            Some(current) => {
-                rank > selected_rank
-                    || (rank == selected_rank && candidate.upload_time > current.upload_time)
-            }
-        };
-        if should_replace {
-            selected_rank = rank;
-            selected = Some(candidate);
-        }
-    }
-
-    selected.with_context(|| {
-        format!(
-            "no supported source distribution (.tar.gz/.tgz) found on PyPI for version {}",
-            version
-        )
-    })
-}
-
-fn download_file(url: &str, destination: &Path) -> Result<()> {
-    let response = ureq::get(url)
-        .call()
-        .with_context(|| format!("failed to download source archive: {}", url))?;
-    let mut reader = response.into_reader();
-    let mut file = fs::File::create(destination).with_context(|| {
-        format!(
-            "failed to create destination file: {}",
-            destination.display()
-        )
-    })?;
-    std::io::copy(&mut reader, &mut file).with_context(|| {
-        format!(
-            "failed to write downloaded archive: {}",
-            destination.display()
-        )
-    })?;
-    file.flush().with_context(|| {
-        format!(
-            "failed to flush downloaded archive: {}",
-            destination.display()
-        )
-    })?;
-    Ok(())
-}
-
-fn verify_sha256(path: &Path, expected_sha256: &str) -> Result<()> {
-    if expected_sha256.trim().is_empty() {
-        return Ok(());
-    }
-
-    let mut file = fs::File::open(path).with_context(|| {
-        format!(
-            "failed to open downloaded archive for checksum: {}",
-            path.display()
-        )
-    })?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 8192];
-    loop {
-        let n = file.read(&mut buf).with_context(|| {
-            format!(
-                "failed to read downloaded archive for checksum: {}",
-                path.display()
-            )
-        })?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-
-    let actual = format!("{:x}", hasher.finalize());
-    if actual != expected_sha256.to_ascii_lowercase() {
-        anyhow::bail!(
-            "sha256 mismatch for {}: expected {}, got {}",
-            path.display(),
-            expected_sha256,
-            actual
-        );
-    }
-
-    Ok(())
-}
-
-fn extract_tar_gz(archive_path: &Path, extract_dir: &Path) -> Result<()> {
-    let f = fs::File::open(archive_path)
-        .with_context(|| format!("failed to open archive: {}", archive_path.display()))?;
-    let decoder = GzDecoder::new(f);
-    let mut archive = Archive::new(decoder);
-    archive
-        .unpack(extract_dir)
-        .with_context(|| format!("failed to extract archive: {}", archive_path.display()))?;
-    Ok(())
-}
-
-fn detect_extract_root(extract_dir: &Path) -> Result<PathBuf> {
-    let entries = fs::read_dir(extract_dir).with_context(|| {
-        format!(
-            "failed to read extract directory: {}",
-            extract_dir.display()
-        )
-    })?;
-    let mut dirs = Vec::new();
-    for entry in entries {
-        let path = entry?.path();
-        if path.is_dir() {
-            dirs.push(path);
-        }
-    }
-    if dirs.len() == 1 {
-        Ok(dirs.remove(0))
-    } else {
-        Ok(extract_dir.to_path_buf())
-    }
-}
-
-fn preferred_url_from_info(info: &serde_json::Map<String, Value>) -> Option<String> {
-    if let Some(project_urls) = info.get("project_urls").and_then(Value::as_object) {
+    if let Some(project_urls) = info.project_urls.as_object() {
         // Try repository-like keys first so URL is as close as possible to VCS.
         let candidates = [
             "Repository",
@@ -413,18 +92,17 @@ fn preferred_url_from_info(info: &serde_json::Map<String, Value>) -> Option<Stri
             }
         }
     }
-    let home_page = info
-        .get("home_page")
-        .and_then(Value::as_str)
-        .and_then(non_empty)
-        .and_then(normalize_url);
 
-    home_page.or_else(|| {
-        info.get("project_url")
-            .and_then(Value::as_str)
-            .and_then(non_empty)
-            .and_then(normalize_url)
-    })
+    info.home_page
+        .as_deref()
+        .and_then(non_empty)
+        .and_then(normalize_url)
+        .or_else(|| {
+            info.project_url
+                .as_deref()
+                .and_then(non_empty)
+                .and_then(normalize_url)
+        })
 }
 
 fn enrich_meta_from_pyproject(root: &Path, meta: &mut SpecMeta) {
@@ -563,6 +241,8 @@ fn enrich_meta_from_pkg_info(root: &Path, meta: &mut SpecMeta) {
 }
 
 fn find_pkg_info(root: &Path) -> Option<PathBuf> {
+    use std::ffi::OsStr;
+
     let root_pkg = root.join("PKG-INFO");
     if root_pkg.exists() {
         return Some(root_pkg);
@@ -863,6 +543,8 @@ fn detect_license_from_source_tree(root: &Path) -> Option<String> {
 }
 
 fn looks_like_license_file(path: &Path) -> bool {
+    use std::ffi::OsStr;
+
     let name = path
         .file_name()
         .and_then(OsStr::to_str)
@@ -943,10 +625,10 @@ fn detect_spdx_from_license_text(text: &str) -> Option<String> {
     None
 }
 
-fn resolve_license_from_info(info: &serde_json::Map<String, Value>) -> String {
+fn resolve_license_from_info(info: &PypiInfo) -> String {
     let raw = info
-        .get("license")
-        .and_then(Value::as_str)
+        .license
+        .as_deref()
         .unwrap_or_default()
         .trim()
         .to_string();
@@ -954,7 +636,7 @@ fn resolve_license_from_info(info: &serde_json::Map<String, Value>) -> String {
         return raw;
     }
 
-    let classifiers = match info.get("classifiers").and_then(Value::as_array) {
+    let classifiers = match info.classifiers.as_array() {
         Some(v) => v,
         None => return String::new(),
     };
@@ -1057,10 +739,6 @@ fn filename_dist_name(filename: &str, version: &str) -> Option<String> {
         }
     }
     None
-}
-
-fn normalize_srcname(name: &str) -> String {
-    name.trim().to_lowercase().replace(['_', '.'], "-")
 }
 
 fn non_empty(s: &str) -> Option<&str> {
@@ -1355,4 +1033,32 @@ fn split_sentences(text: &str) -> Vec<String> {
         out.push(text.trim().to_string());
     }
     out
+}
+
+const FALLBACK_LICENSE: &str = "LicenseRef-Unknown-Please-Check-Manual";
+
+use std::sync::OnceLock;
+
+use regex::Regex;
+
+fn re_license_ops_with_capture() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    // Treat textual operators only when separated by whitespace, so SPDX IDs
+    // like GPL-2.0-or-later are not split into broken tokens.
+    RE.get_or_init(|| Regex::new("(?i)(?:\\s*(?:/|\\||,)\\s*|\\s+(?:or|and)\\s+)").unwrap())
+}
+
+fn re_spdx_like_core() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^[A-Za-z0-9.+-]+(?:\s+WITH\s+[A-Za-z0-9.+-]+)?$").unwrap())
+}
+
+fn re_md_link() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\[([^\]]+)\]\([^\)]+\)").unwrap())
+}
+
+fn re_html_tag() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"<[^>]+>").unwrap())
 }

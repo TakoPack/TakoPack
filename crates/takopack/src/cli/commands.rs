@@ -1,11 +1,15 @@
+use std::path::Path;
+
 use clap::Parser;
 use nu_ansi_term::Color::Red;
 
 use takopack_core::errors::Result;
+use takopack_python::cli::PythonSubcommands;
+use takopack_python::pypi::PypiFetcher;
 use takopack_rust::package::*;
 use takopack_rust::range_audit::{self, RangeCapabilityPolicy};
 
-use super::options::{CargoOpt, Cli, Opt, PyOpt};
+use super::options::{CargoOpt, Cli, Opt};
 
 pub fn run() {
     env_logger::init();
@@ -58,13 +62,11 @@ fn real_main() -> Result<i32> {
             }
         },
         Py(py_opt) => match py_opt {
-            PyOpt::Package {
-                name,
-                version,
-                output,
-            } => {
-                log::info!("packaging Python package from PyPI");
-                takopack_python::process_python_package(&name, version.as_deref(), output)?;
+            PythonSubcommands::Package { name, version, .. } => {
+                let package = PypiFetcher::new(&name, version.as_deref()).fetch().unwrap();
+
+                package.render(&Path::new(".")).unwrap();
+
                 Ok(0)
             }
         },

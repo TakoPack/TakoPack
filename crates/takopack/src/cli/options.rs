@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand, builder::Styles, builder::styling::AnsiColor};
 
+use takopack_python::cli::PythonSubcommands;
 use takopack_rust::{
     package::{PackageExecuteArgs, PackageExtractArgs, PackageInitArgs},
     range_audit::RangeCapabilityPolicy,
@@ -27,7 +28,7 @@ pub enum Opt {
     Cargo(CargoOpt),
     /// Python package operations
     #[command(subcommand)]
-    Py(PyOpt),
+    Py(PythonSubcommands),
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -100,24 +101,5 @@ pub enum CargoOpt {
         /// Local Cargo directory registry. Overrides [registry].local_path in takopack.toml
         #[arg(long, value_name = "DIR")]
         registry: Option<std::path::PathBuf>,
-    },
-}
-
-#[derive(Debug, Clone, Subcommand)]
-pub enum PyOpt {
-    /// Package a Python package from PyPI and generate RPM spec file
-    #[command(alias = "pkg")]
-    Package {
-        /// PyPI package name
-        #[arg(value_name = "NAME")]
-        name: String,
-
-        /// Package version (optional, latest if omitted)
-        #[arg(value_name = "VERSION")]
-        version: Option<String>,
-
-        /// Output directory for generated spec folder (default: current directory)
-        #[arg(short, long, value_name = "DIR")]
-        output: Option<std::path::PathBuf>,
     },
 }

@@ -8,7 +8,7 @@ license.workspace = true
 anyhow = { workspace = true }
 cargo = { workspace = true }
 cargo-util-terminal = { workspace = true }
-clap = { workspace = true }
+clap = { workspace = true, features = ["cargo", "derive", "wrap_help"] }
 filetime = { workspace = true }
 flate2 = { workspace = true }
 futures = { workspace = true }

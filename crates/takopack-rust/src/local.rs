@@ -232,6 +232,7 @@ fn write_placeholder_file(root: &Path, relative_path: &str) -> Result<()> {
         _ => "Placeholder for takopack localpkg spec generation.\n",
     };
     write_file_ensuring_dir(&path, content)
+        .with_context(|| format!("failed write placeholder file"))
 }
 
 fn safe_manifest_relative_path(path: &str) -> Result<PathBuf> {
