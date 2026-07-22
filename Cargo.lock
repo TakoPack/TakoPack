@@ -3940,11 +3940,75 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "sha2 0.10.9",
+ "takopack-core",
+ "takopack-python",
+ "takopack-rust",
  "tar",
  "tempfile",
  "textwrap",
  "toml 0.8.23",
  "toml_edit 0.22.27",
+ "ureq",
+ "walkdir",
+]
+
+[[package]]
+name = "takopack-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dirs",
+ "itertools 0.13.0",
+ "log",
+ "nu-ansi-term",
+ "semver",
+ "serde",
+ "tempfile",
+ "toml 0.8.23",
+ "walkdir",
+]
+
+[[package]]
+name = "takopack-python"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "flate2",
+ "regex",
+ "serde_json",
+ "sha2 0.10.9",
+ "takopack-core",
+ "tar",
+ "tempfile",
+ "toml 0.8.23",
+ "ureq",
+]
+
+[[package]]
+name = "takopack-rust"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cargo",
+ "cargo-util-terminal",
+ "clap",
+ "filetime",
+ "flate2",
+ "futures",
+ "glob",
+ "itertools 0.13.0",
+ "log",
+ "nu-ansi-term",
+ "regex",
+ "semver",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "sha2 0.10.9",
+ "takopack-core",
+ "tar",
+ "tempfile",
+ "toml 0.8.23",
  "ureq",
  "walkdir",
 ]

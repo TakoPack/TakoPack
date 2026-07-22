@@ -1,6 +1,6 @@
 use anyhow::Context;
-use serde::de::IgnoredAny;
 use serde::Deserialize;
+use serde::de::IgnoredAny;
 use toml;
 
 use crate::errors::*;
@@ -185,11 +185,7 @@ pub enum PackageKey<'a> {
 impl<'a> PackageKey<'a> {
     pub fn feature(f: &'a str) -> PackageKey<'a> {
         use self::PackageKey::*;
-        if f.is_empty() {
-            BareLib
-        } else {
-            FeatureLib(f)
-        }
+        if f.is_empty() { BareLib } else { FeatureLib(f) }
     }
 
     pub fn from_key(k: &'a str) -> Option<PackageKey<'a>> {
@@ -219,18 +215,18 @@ impl<'a> PackageKey<'a> {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub(crate) struct TakopackToml {
+pub struct TakopackToml {
     pub ruyispec: Option<RuyispecConfig>,
     pub registry: Option<RegistryConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub(crate) struct RuyispecConfig {
+pub struct RuyispecConfig {
     pub local_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub(crate) struct RegistryConfig {
+pub struct RegistryConfig {
     pub local_path: Option<PathBuf>,
 }
 
@@ -298,7 +294,7 @@ pub fn ruyispec_package_root(ruyispec_dir: &Path) -> PathBuf {
     }
 }
 
-pub(crate) fn load_takopack_toml() -> Result<Option<(PathBuf, TakopackToml)>> {
+pub fn load_takopack_toml() -> Result<Option<(PathBuf, TakopackToml)>> {
     let Some(path) = find_takopack_toml() else {
         return Ok(None);
     };

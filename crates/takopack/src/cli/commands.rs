@@ -1,9 +1,9 @@
 use clap::Parser;
 use nu_ansi_term::Color::Red;
 
-use takopack::cargo_packaging::package::*;
-use takopack::cargo_packaging::range_audit::{self, RangeCapabilityPolicy};
-use takopack::errors::Result;
+use takopack_core::errors::Result;
+use takopack_rust::package::*;
+use takopack_rust::range_audit::{self, RangeCapabilityPolicy};
 
 use super::options::{CargoOpt, Cli, Opt, PyOpt};
 
@@ -36,7 +36,7 @@ fn real_main() -> Result<i32> {
                 range_capability_policy,
             } => {
                 log::info!("packaging from local directory: {:?}", path);
-                takopack::cargo_packaging::local::process_local_package(
+                takopack_rust::local::process_local_package(
                     &path,
                     output,
                     finish,
@@ -46,28 +46,25 @@ fn real_main() -> Result<i32> {
             }
             CargoOpt::RegistrySync { dry_run, jobs } => {
                 log::info!("starting registry sync");
-                takopack::cargo_packaging::registry_sync::run_registry_sync(dry_run, jobs)
+                takopack_rust::registry_sync::run_registry_sync(dry_run, jobs)
             }
             CargoOpt::ResolveCheck { path, registry } => {
                 log::info!("starting resolve check");
-                takopack::cargo_packaging::resolve_check::run_resolve_check(
-                    &path,
-                    registry.as_deref(),
-                )
+                takopack_rust::resolve_check::run_resolve_check(&path, registry.as_deref())
             }
             CargoOpt::BuildReqs { path, registry } => {
                 log::info!("generating dynamic BuildRequires");
-                takopack::cargo_packaging::buildreqs::run_buildreqs(&path, registry.as_deref())
+                takopack_rust::buildreqs::run_buildreqs(&path, registry.as_deref())
             }
         },
-        Opt::Py(py_opt) => match py_opt {
+        Py(py_opt) => match py_opt {
             PyOpt::Package {
                 name,
                 version,
                 output,
             } => {
                 log::info!("packaging Python package from PyPI");
-                takopack::python::process_python_package(&name, version.as_deref(), output)?;
+                takopack_python::process_python_package(&name, version.as_deref(), output)?;
                 Ok(0)
             }
         },
@@ -88,9 +85,9 @@ fn package_crate(
     let crate_name = process.crate_info().crate_name();
     let version = process.crate_info().version();
 
-    let output_names = takopack::util::rust_crate_output_names(crate_name, version);
+    let output_names = takopack_core::util::rust_crate_output_names(crate_name, version);
     let final_output =
-        takopack::util::package_final_output_dir(extract.directory.as_deref(), &output_names)?;
+        takopack_core::util::package_final_output_dir(extract.directory.as_deref(), &output_names)?;
     extract.directory = Some(final_output.clone());
 
     process.extract(extract)?;
@@ -126,7 +123,7 @@ fn package_crate(
 
     fs::copy(&source_spec, &final_spec)?;
     let final_cargo_toml =
-        takopack::util::copy_normalized_cargo_toml_to_dir(output_path, &final_output)?;
+        takopack_core::util::copy_normalized_cargo_toml_to_dir(output_path, &final_output)?;
     log::info!("Spec file saved to: {}", final_spec.display());
     println!("Spec file: {}", final_spec.display());
 

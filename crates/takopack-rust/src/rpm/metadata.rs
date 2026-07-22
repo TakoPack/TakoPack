@@ -3,12 +3,16 @@ use std::fmt::{self, Write};
 
 use cargo::{core::Dependency, util::OptVersionReq};
 use semver::Version;
+use takopack_core::{
+    config::{self, Config, PackageKey},
+    errors::*,
+};
 
-use crate::cargo_packaging::crates::dependency_is_runtime_candidate;
-use crate::config::{self, Config, PackageKey};
-use crate::errors::*;
-use crate::rpm::spec::{
-    self, CrateCapability, CrateRequirement, RequirementVersion, SpecPackage, SpecSource,
+use crate::{
+    crates::dependency_is_runtime_candidate,
+    rpm::spec::{
+        self, CrateCapability, CrateRequirement, RequirementVersion, SpecPackage, SpecSource,
+    },
 };
 
 pub struct Source {
@@ -131,7 +135,7 @@ impl CrateDep {
                     version_without_build.to_string()
                 };
                 if let Ok(ver) = Version::parse(&version_num) {
-                    let compat_version = crate::util::calculate_compat_version(&ver);
+                    let compat_version = takopack_core::util::calculate_compat_version(&ver);
                     format!("{}-{}", crate_base, compat_version)
                 } else {
                     // Legacy fallback only: structured Cargo requirements use
@@ -179,7 +183,7 @@ impl fmt::Display for Source {
         let pkg_name = self.crate_name.replace('_', "-");
 
         let (pkgname, rpm_name) = if let Ok(ver) = Version::parse(&self.version) {
-            let output_names = crate::util::rust_crate_output_names(&self.crate_name, &ver);
+            let output_names = takopack_core::util::rust_crate_output_names(&self.crate_name, &ver);
             let pkgname = output_names
                 .directory
                 .strip_prefix("rust-")
@@ -308,7 +312,7 @@ fn cargo_dep_crate_name(crate_name: &str, lower_bound: Option<&str>) -> String {
             format!(
                 "{}-{}",
                 crate_base,
-                crate::util::calculate_compat_version(&version)
+                takopack_core::util::calculate_compat_version(&version)
             )
         } else {
             crate_base
@@ -740,12 +744,13 @@ pub fn rpm_feature_package_name(name: &str, feature: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{crate_requirements_from_cargo_deps, CrateDep, Source};
-    use crate::cargo_packaging::crates::{all_dependencies_and_features, transitive_deps};
+    use super::{CrateDep, Source, crate_requirements_from_cargo_deps};
+    use crate::crates::{all_dependencies_and_features, transitive_deps};
     use crate::rpm::spec;
-    use cargo::core::{dependency::DepKind, Dependency, EitherManifest, SourceId};
-    use cargo::util::toml::read_manifest;
+
     use cargo::GlobalContext;
+    use cargo::core::{Dependency, EitherManifest, SourceId, dependency::DepKind};
+    use cargo::util::toml::read_manifest;
     use std::fs;
 
     fn test_dep(
@@ -830,9 +835,11 @@ mod tests {
         let dep = test_dep("base64", "0.22.1", false, &[]);
         let rendered = rendered_cargo_requirements(&[dep]);
 
-        assert!(rendered
-            .iter()
-            .all(|line| !line.contains("crate(base64-0.22/default)")));
+        assert!(
+            rendered
+                .iter()
+                .all(|line| !line.contains("crate(base64-0.22/default)"))
+        );
         assert_eq!(
             vec!["Requires:       crate(base64-0.22) >= 0.22.1"],
             rendered
@@ -859,9 +866,11 @@ mod tests {
         let dep = test_dep("serde", "1", false, &["derive"]);
         let rendered = rendered_cargo_requirements(&[dep]);
 
-        assert!(rendered
-            .iter()
-            .all(|line| !line.contains("crate(serde-1/default)")));
+        assert!(
+            rendered
+                .iter()
+                .all(|line| !line.contains("crate(serde-1/default)"))
+        );
         assert_eq!(
             vec!["Requires:       crate(serde-1/derive) >= 1.0.0"],
             rendered
@@ -928,9 +937,11 @@ generate = ["bindgen"]
         let generate = rendered_feature_requirements(toml, "generate");
         assert!(generate.contains(&"Requires:       crate(cc-1) >= 1.0.0".to_string()));
         assert!(generate.contains(&"Requires:       crate(pkg-config-0.3) >= 0.3.16".to_string()));
-        assert!(generate
-            .iter()
-            .any(|line| line == "Requires:       crate(bindgen-0.72/runtime) >= 0.72.0"));
+        assert!(
+            generate
+                .iter()
+                .any(|line| line == "Requires:       crate(bindgen-0.72/runtime) >= 0.72.0")
+        );
         assert!(generate.iter().all(|line| !line.contains("proptest")));
     }
 

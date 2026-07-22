@@ -11,7 +11,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tar::Archive;
 
-use crate::util::write_file_ensuring_dir;
+use takopack_core::util::write_file_ensuring_dir;
 
 const FALLBACK_LICENSE: &str = "LicenseRef-Unknown-Please-Check-Manual";
 
@@ -1064,11 +1064,7 @@ fn normalize_srcname(name: &str) -> String {
 }
 
 fn non_empty(s: &str) -> Option<&str> {
-    if s.trim().is_empty() {
-        None
-    } else {
-        Some(s)
-    }
+    if s.trim().is_empty() { None } else { Some(s) }
 }
 
 fn cleanup_single_line(s: &str) -> String {

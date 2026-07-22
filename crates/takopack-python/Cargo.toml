@@ -1,0 +1,16 @@
+[package]
+name = "takopack-python"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = { workspace = true }
+flate2 = { workspace = true }
+regex = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+takopack-core = { workspace = true }
+tar = { workspace = true }
+tempfile = { workspace = true }
+toml = { workspace = true }
+ureq = { workspace = true, default-features = true, features = ["tls"] }

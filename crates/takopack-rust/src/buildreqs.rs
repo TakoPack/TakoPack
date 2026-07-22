@@ -4,10 +4,10 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use semver::Version;
+use takopack_core::errors::Result;
+use takopack_core::util::calculate_compat_version;
 
-use crate::cargo_packaging::resolve_check::{self, LockPackage};
-use crate::errors::Result;
-use crate::util::calculate_compat_version;
+use crate::resolve_check::{self, LockPackage};
 
 pub fn run_buildreqs(path: &Path, registry: Option<&Path>) -> Result<i32> {
     let report = resolve_check::resolve_single_crate(path, registry)?;

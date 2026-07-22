@@ -1,6 +1,6 @@
-use clap::{builder::styling::AnsiColor, builder::Styles, Parser, Subcommand};
+use clap::{Parser, Subcommand, builder::Styles, builder::styling::AnsiColor};
 
-use takopack::cargo_packaging::{
+use takopack_rust::{
     package::{PackageExecuteArgs, PackageExtractArgs, PackageInitArgs},
     range_audit::RangeCapabilityPolicy,
 };
