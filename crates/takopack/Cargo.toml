@@ -1,0 +1,47 @@
+[package]
+name = "takopack"
+version = "0.1.1"
+authors = [
+  "misaka00251 <liuxin@iscas.ac.cn>",
+  "yyjeqhc <jialin.oerv@isrc.iscas.ac.cn",
+]
+license = "MIT/Apache-2.0"
+repository = "https://github.com/TakoPack/TakoPack"
+description = "Generate Linux distribution RPM spec files from language package metadata."
+edition = "2024"
+rust-version = "1.94"
+
+[dependencies]
+anyhow = { workspace = true }
+cargo = { workspace = true }
+cargo-util = { workspace = true }
+cargo-util-schemas = { workspace = true }
+cargo-util-terminal = { workspace = true }
+clap = { workspace = true }
+clap_mangen = { workspace = true }
+dirs = { workspace = true }
+env_logger = { workspace = true }
+filetime = { workspace = true }
+flate2 = { workspace = true }
+futures = { workspace = true }
+git2 = { workspace = true }
+glob = { workspace = true }
+itertools = { workspace = true }
+log = { workspace = true }
+nu-ansi-term = { workspace = true }
+regex = { workspace = true }
+semver = { workspace = true }
+serde = { workspace = true }
+serde_derive = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+takopack-core = { workspace = true }
+takopack-python = { workspace = true }
+takopack-rust = { workspace = true }
+tar = { workspace = true }
+tempfile = { workspace = true }
+textwrap = { workspace = true }
+toml = { workspace = true }
+toml_edit = { workspace = true }
+ureq = { workspace = true }
+walkdir = { workspace = true }

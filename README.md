@@ -14,7 +14,7 @@ TakoPack 是一个用于将各种语言生态系统的软件（目前支持 Rust
 ## 安装
 
 ```bash
-cargo install --path .
+cargo install --path crates/takopack
 ```
 
 或从源码构建：

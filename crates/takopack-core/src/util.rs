@@ -12,7 +12,7 @@ use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use itertools::Itertools;
 use semver::Version;
 use walkdir::WalkDir;
@@ -234,7 +234,7 @@ pub fn expect_success(cmd: &mut Command, err: &str) -> Result<(), anyhow::Error>
     }
 }
 
-pub(crate) fn traverse_depth<'a, V, F>(succ: &'a F, key: V) -> BTreeSet<V>
+pub fn traverse_depth<'a, V, F>(succ: &'a F, key: V) -> BTreeSet<V>
 where
     V: Ord + Copy + 'a,
     F: Fn(&V) -> Option<&'a Vec<V>>,

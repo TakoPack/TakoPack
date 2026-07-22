@@ -1,21 +1,21 @@
-use anyhow::{format_err, Context, Error};
+use anyhow::{Context, Error, format_err};
 use cargo::{
     core::{
-        manifest::ManifestMetadata, registry::PackageRegistry, resolver::features::CliFeatures,
         Dependency, EitherManifest, FeatureValue, Manifest, Package, PackageId, Registry, SourceId,
-        Summary, Target, TargetKind, Workspace,
+        Summary, Target, TargetKind, Workspace, manifest::ManifestMetadata,
+        registry::PackageRegistry, resolver::features::CliFeatures,
     },
     ops::{self, PackageMessageFormat, PackageOpts, Packages},
     sources::{
-        source::{MaybePackage, QueryKind},
         IndexSummary, SourceConfigMap,
+        source::{MaybePackage, QueryKind},
     },
     util::{
-        cache_lock::CacheLockMode, interning::InternedString, toml::read_manifest, FileLock,
-        Filesystem, GlobalContext,
+        FileLock, Filesystem, GlobalContext, cache_lock::CacheLockMode, interning::InternedString,
+        toml::read_manifest,
     },
 };
-use filetime::{set_file_times, FileTime};
+use filetime::{FileTime, set_file_times};
 use flate2::read::GzDecoder;
 use glob::Pattern;
 use itertools::Itertools;
@@ -31,7 +31,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::{self, ffi::OsStr};
 
-use crate::errors::*;
+use takopack_core::{errors::*, takopack_bail, takopack_info, takopack_warn};
 #[derive(Debug)]
 pub struct CrateInfo {
     // only used for to_registry_toml in extract_crate. DO NOT USE ELSEWHERE
@@ -1195,9 +1195,9 @@ mod tests {
         all_dependencies_and_features, dependency_is_runtime_candidate,
         dependency_matches_openruyi_linux_target,
     };
-    use cargo::core::{dependency::DepKind, Dependency, EitherManifest, SourceId};
-    use cargo::util::toml::read_manifest;
     use cargo::GlobalContext;
+    use cargo::core::{Dependency, EitherManifest, SourceId, dependency::DepKind};
+    use cargo::util::toml::read_manifest;
     use std::fs;
 
     fn manifest_from_toml(toml: &str) -> cargo::core::Manifest {
@@ -1228,8 +1228,8 @@ mod tests {
     }
 
     #[test]
-    fn feature_graph_includes_build_deps_and_target_normal_deps_but_excludes_dev_and_special_deps_by_default(
-    ) {
+    fn feature_graph_includes_build_deps_and_target_normal_deps_but_excludes_dev_and_special_deps_by_default()
+     {
         let manifest = manifest_from_toml(
             r#"
 [package]

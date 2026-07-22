@@ -26,10 +26,10 @@ use glob::glob;
 use regex::Regex;
 use serde_derive::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use takopack_core::config::{default_registry_dir, load_takopack_toml};
+use takopack_core::errors::Result;
+use takopack_core::{takopack_bail, takopack_warn};
 use walkdir::WalkDir;
-
-use crate::config::{default_registry_dir, load_takopack_toml};
-use crate::errors::Result;
 
 const TAKOPACK_METADATA_DIR: &str = ".takopack";
 const REGISTRY_MARKER: &str = "managed-by-takopack";
@@ -183,11 +183,7 @@ pub fn run_registry_sync(dry_run: bool, jobs: usize) -> Result<i32> {
     println!("  missing_cargo_toml={}", missing_cargo_toml_warnings);
     println!("  sync_errors={}", sync_errors);
 
-    if sync_errors > 0 {
-        Ok(1)
-    } else {
-        Ok(0)
-    }
+    if sync_errors > 0 { Ok(1) } else { Ok(0) }
 }
 
 // ---------------------------------------------------------------------------
@@ -767,27 +763,29 @@ fn sync_entries_parallel(
         let ruyispec_dir = Arc::clone(&ruyispec_dir);
         let registry_dir = Arc::clone(&registry_dir);
 
-        handles.push(thread::spawn(move || loop {
-            let job = {
-                let mut queue = queue.lock().expect("sync job queue should not be poisoned");
-                queue.pop_front()
-            };
-
-            let Some(job) = job else {
-                break;
-            };
-
-            log::info!("{} {}", job.kind.gerund(), job.entry.registry_path);
-            if let Err(err) = sync_crate(&job.entry, &ruyispec_dir, &registry_dir) {
-                let failure = SyncFailure {
-                    kind: job.kind,
-                    registry_path: job.entry.registry_path,
-                    error: format!("{:#}", err),
+        handles.push(thread::spawn(move || {
+            loop {
+                let job = {
+                    let mut queue = queue.lock().expect("sync job queue should not be poisoned");
+                    queue.pop_front()
                 };
-                failures
-                    .lock()
-                    .expect("sync failure list should not be poisoned")
-                    .push(failure);
+
+                let Some(job) = job else {
+                    break;
+                };
+
+                log::info!("{} {}", job.kind.gerund(), job.entry.registry_path);
+                if let Err(err) = sync_crate(&job.entry, &ruyispec_dir, &registry_dir) {
+                    let failure = SyncFailure {
+                        kind: job.kind,
+                        registry_path: job.entry.registry_path,
+                        error: format!("{:#}", err),
+                    };
+                    failures
+                        .lock()
+                        .expect("sync failure list should not be poisoned")
+                        .push(failure);
+                }
             }
         }));
     }
@@ -1167,9 +1165,10 @@ mod tests {
         .unwrap();
 
         let err = load_index(temp.path()).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("unsupported registry index schema_version 2; expected 1"));
+        assert!(
+            err.to_string()
+                .contains("unsupported registry index schema_version 2; expected 1")
+        );
     }
 
     #[test]
@@ -1199,9 +1198,10 @@ mod tests {
 
         let err = ensure_registry_managed(&registry, false).unwrap_err();
 
-        assert!(err
-            .to_string()
-            .contains("does not look like a TakoPack-managed registry"));
+        assert!(
+            err.to_string()
+                .contains("does not look like a TakoPack-managed registry")
+        );
         assert!(registry.join("serde-1.0.0").is_dir());
     }
 
@@ -1233,17 +1233,22 @@ mod tests {
         assert_eq!(scan.warnings.len(), 2);
         assert_eq!(scan.warning_count(ScanWarningKind::MissingCargoToml), 1);
         assert_eq!(scan.warning_count(ScanWarningKind::ParseFailed), 1);
-        assert!(scan
-            .warnings
-            .iter()
-            .any(|warning| warning.message.contains("has no Cargo.toml override")));
-        assert!(scan.warnings.iter().any(|warning| warning
-            .message
-            .contains("failed to parse crate_name/full_version")));
-        assert!(!scan
-            .warnings
-            .iter()
-            .any(|warning| warning.message.contains("rust-bin")));
+        assert!(
+            scan.warnings
+                .iter()
+                .any(|warning| warning.message.contains("has no Cargo.toml override"))
+        );
+        assert!(scan.warnings.iter().any(|warning| {
+            warning
+                .message
+                .contains("failed to parse crate_name/full_version")
+        }));
+        assert!(
+            !scan
+                .warnings
+                .iter()
+                .any(|warning| warning.message.contains("rust-bin"))
+        );
     }
 
     #[test]
@@ -1286,9 +1291,10 @@ mod tests {
 
         let err = extract_tarball(&tarball, temp.path(), "foo-1.2.3").unwrap_err();
 
-        assert!(err
-            .to_string()
-            .contains("unexpected top-level directory bar-1.2.3; expected foo-1.2.3"));
+        assert!(
+            err.to_string()
+                .contains("unexpected top-level directory bar-1.2.3; expected foo-1.2.3")
+        );
     }
 
     #[test]
@@ -1308,9 +1314,10 @@ mod tests {
 
         let err = extract_tarball(&tarball, temp.path(), "foo-1.2.3").unwrap_err();
 
-        assert!(err
-            .to_string()
-            .contains("crate archive for foo-1.2.3 did not contain any files"));
+        assert!(
+            err.to_string()
+                .contains("crate archive for foo-1.2.3 did not contain any files")
+        );
     }
 
     fn test_tarball(entries: &[(&str, &[u8])]) -> Vec<u8> {

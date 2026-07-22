@@ -1,0 +1,16 @@
+[package]
+name = "takopack-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = { workspace = true }
+dirs = { workspace = true }
+itertools = { workspace = true }
+log = { workspace = true }
+nu-ansi-term = { workspace = true }
+semver = { workspace = true }
+serde = { workspace = true }
+tempfile = { workspace = true }
+toml = { workspace = true }
+walkdir = { workspace = true }

@@ -5,25 +5,23 @@ use std::io::{self, ErrorKind, Seek, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use flate2::read::GzDecoder;
-use flate2::write::GzEncoder;
-use flate2::Compression;
+use flate2::{Compression, read::GzDecoder, write::GzEncoder};
+use takopack_core::{
+    config::{Config, PackageKey},
+    errors::*,
+    util::{self, copy_tree, expect_success, traverse_depth},
+};
+use takopack_core::{takopack_bail, takopack_info, takopack_warn};
 use tar::{Archive, Builder};
 use tempfile;
 
-use crate::cargo_packaging::crates::{
-    all_dependencies_and_features, show_dep, CrateDepInfo, CrateInfo,
-};
-use crate::config::{Config, PackageKey};
-use crate::errors::*;
-use crate::util::{self, copy_tree, expect_success, traverse_depth};
-
-use self::metadata::{base_crate_package_name, rpm_upstream_version};
 use self::metadata::{Description, Package, Source};
+use self::metadata::{base_crate_package_name, rpm_upstream_version};
 use self::spec::{
-    render_build_check_install_placeholder, render_changelog_section, render_files_section,
-    render_patch_prep_placeholder, SpecFiles,
+    SpecFiles, render_build_check_install_placeholder, render_changelog_section,
+    render_files_section, render_patch_prep_placeholder,
 };
+use crate::crates::{CrateDepInfo, CrateInfo, all_dependencies_and_features, show_dep};
 
 pub mod metadata;
 pub mod spec;
@@ -613,13 +611,19 @@ fn transform_feature_packages(
                 log::debug!("transitive deps of feature {}: {:?}", f, dep_feats);
                 takopack_bail!(
                     "Tried to merge features {} and {} as they are not representable separately\n\
-                     in takopack, but this resulted in a feature cycle. You need to manually patch the package.", f, f_);
+                     in takopack, but this resulted in a feature cycle. You need to manually patch the package.",
+                    f,
+                    f_
+                );
             } else {
                 takopack_warn!(
                     "Merged features {} and {} as they are not representable separately in takopack.\n\
                      We checked that this does not break the package in an obvious way (feature cycle), however\n\
                      if there is a more sophisticated breakage, you'll have to manually patch those \
-                     features instead.", f, f_);
+                     features instead.",
+                    f,
+                    f_
+                );
             }
         }
     }
@@ -846,7 +850,7 @@ fn reduce_provides(
     // Calculate provides by following 0- or 1-length dependency lists.
     let mut provides = BTreeMap::new();
     let mut provided = Vec::new();
-    for (&f, (ref ff, ref dd)) in features_with_deps.iter() {
+    for (&f, (ff, dd)) in features_with_deps.iter() {
         //takopack_info!("provides considering: {:?}", &f);
         if !dd.is_empty() {
             continue;

@@ -13,10 +13,10 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use semver::{Comparator, Op, Version, VersionReq};
+use takopack_core::util::calculate_compat_version;
 
-use crate::cargo_packaging::crates::dependency_is_runtime_candidate;
+use crate::crates::dependency_is_runtime_candidate;
 use crate::rpm::spec::normalize_crate_name;
-use crate::util::calculate_compat_version;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -341,7 +341,7 @@ fn version_decrement(v: &Version) -> Option<Version> {
 
 fn update_lower(current: &mut Option<Version>, candidate: &Version) {
     match current {
-        Some(ref cur) if candidate > cur => *current = Some(candidate.clone()),
+        Some(cur) if candidate > cur => *current = Some(candidate.clone()),
         None => *current = Some(candidate.clone()),
         _ => {}
     }
@@ -350,7 +350,7 @@ fn update_lower(current: &mut Option<Version>, candidate: &Version) {
 fn update_upper(current: &mut Option<Version>, candidate: &Version) {
     // For exclusive upper bound, convert to inclusive by decrementing
     match current {
-        Some(ref cur) if candidate < cur => *current = Some(candidate.clone()),
+        Some(cur) if candidate < cur => *current = Some(candidate.clone()),
         None => *current = Some(candidate.clone()),
         _ => {}
     }
@@ -358,7 +358,7 @@ fn update_upper(current: &mut Option<Version>, candidate: &Version) {
 
 fn update_upper_inclusive(current: &mut Option<Version>, candidate: &Version) {
     match current {
-        Some(ref cur) if candidate < cur => *current = Some(candidate.clone()),
+        Some(cur) if candidate < cur => *current = Some(candidate.clone()),
         None => *current = Some(candidate.clone()),
         _ => {}
     }
@@ -733,9 +733,9 @@ impl RangeAuditReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cargo::GlobalContext;
     use cargo::core::{EitherManifest, SourceId};
     use cargo::util::toml::read_manifest;
-    use cargo::GlobalContext;
     use std::fs;
 
     fn check(req: &str) -> Option<RangeWarning> {

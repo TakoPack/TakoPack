@@ -1,12 +1,13 @@
 use std::path::PathBuf;
 
-use clap::{crate_version, Parser};
+use clap::{Parser, crate_version};
+use takopack_core::config::Config;
+use takopack_core::errors::Result;
+use takopack_core::{takopack_info, takopack_warn, util};
 
-use crate::cargo_packaging::crates::CrateInfo;
-use crate::config::Config;
-use crate::errors::Result;
+use crate::crates::CrateInfo;
 use crate::rpm::{self, RpmPackageInfo};
-use crate::util;
+
 pub struct PackageProcess {
     // below state is filled in during init
     pub crate_info: CrateInfo,
@@ -140,9 +141,12 @@ impl PackageProcess {
 
         // Backup original Cargo.toml under the takopack cargo_back origin path (no cleaning)
         let cargo_toml = output_dir.join("Cargo.toml");
-        if let Err(e) =
-            crate::util::backup_cargo_toml(&cargo_toml, &crate_name, &version, Some("origin"))
-        {
+        if let Err(e) = takopack_core::util::backup_cargo_toml(
+            &cargo_toml,
+            &crate_name,
+            &version,
+            Some("origin"),
+        ) {
             log::warn!("Failed to backup original Cargo.toml: {:?}", e);
         }
 
@@ -265,7 +269,9 @@ impl PackageProcess {
                 }
             };
             match config.overlay_dir(config_path.as_deref()) {
-                None => takopack_warn!("\t •  Create an overlay directory and add it to your config file with overlay = \"/path/to/overlay\""),
+                None => takopack_warn!(
+                    "\t •  Create an overlay directory and add it to your config file with overlay = \"/path/to/overlay\""
+                ),
                 Some(p) => {
                     takopack_warn!("\t •  Add or edit files in your overlay directory:");
                     takopack_warn!("\t    {}", util::rel_p(&p, &curdir));

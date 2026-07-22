@@ -1,15 +1,15 @@
+use crate::rpm::{self, RpmPackageInfo};
 use anyhow::{Context, Result};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use takopack_core::config::Config;
+use takopack_core::util::write_file_ensuring_dir;
 use toml::Value;
 
-use crate::cargo_packaging::crates::CrateInfo;
-use crate::cargo_packaging::package::PackageExecuteArgs;
-use crate::cargo_packaging::range_audit::{self, RangeCapabilityPolicy};
-use crate::config::Config;
-use crate::rpm::{self, RpmPackageInfo};
-use crate::util::write_file_ensuring_dir;
+use crate::crates::CrateInfo;
+use crate::package::PackageExecuteArgs;
+use crate::range_audit::{self, RangeCapabilityPolicy};
 
 /// Process a local crate directory and generate spec file
 pub fn process_local_package(
@@ -281,7 +281,7 @@ fn process_complete_crate(
     let rpm_info =
         RpmPackageInfo::new(&crate_info, env!("CARGO_PKG_VERSION"), config.semver_suffix);
 
-    let output_names = crate::util::rust_crate_output_names(crate_name, version);
+    let output_names = takopack_core::util::rust_crate_output_names(crate_name, version);
 
     if range_capability_policy != RangeCapabilityPolicy::Allow {
         let warnings = range_audit::audit_cargo_dependencies(
@@ -294,7 +294,8 @@ fn process_complete_crate(
     }
 
     // Determine final output package directory.
-    let final_output = crate::util::package_final_output_dir(output_dir.as_deref(), &output_names)?;
+    let final_output =
+        takopack_core::util::package_final_output_dir(output_dir.as_deref(), &output_names)?;
 
     fs::create_dir_all(&final_output)
         .with_context(|| format!("Failed to create output directory: {:?}", final_output))?;
@@ -352,7 +353,7 @@ fn process_complete_crate(
     if source_spec.exists() {
         fs::copy(&source_spec, &final_spec)
             .with_context(|| format!("Failed to copy spec file to: {:?}", final_spec))?;
-        crate::util::copy_normalized_cargo_toml_to_dir(temp_crate_dir, &final_output)?;
+        takopack_core::util::copy_normalized_cargo_toml_to_dir(temp_crate_dir, &final_output)?;
 
         log::info!("Spec file saved to: {}", final_spec.display());
         println!("Spec file: {}", final_spec.display());
@@ -366,11 +367,12 @@ fn process_complete_crate(
 #[cfg(test)]
 mod tests {
     use super::{materialize_manifest_backed_temp_crate, process_local_package};
-    use crate::cargo_packaging::package::PackageExecuteArgs;
-    use crate::cargo_packaging::range_audit::RangeCapabilityPolicy;
-    use crate::util::rust_crate_output_names;
+    use crate::package::PackageExecuteArgs;
+    use crate::range_audit::RangeCapabilityPolicy;
+
     use semver::Version;
     use std::fs;
+    use takopack_core::util::rust_crate_output_names;
 
     #[test]
     fn localpkg_materializes_declared_manifest_paths() {

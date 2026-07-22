@@ -1,0 +1,29 @@
+[package]
+name = "takopack-rust"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = { workspace = true }
+cargo = { workspace = true }
+cargo-util-terminal = { workspace = true }
+clap = { workspace = true }
+filetime = { workspace = true }
+flate2 = { workspace = true }
+futures = { workspace = true }
+glob = { workspace = true }
+itertools = { workspace = true }
+log = { workspace = true }
+nu-ansi-term = { workspace = true }
+regex = { workspace = true }
+semver = { workspace = true }
+serde = { workspace = true }
+serde_derive = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+takopack-core = { workspace = true }
+tar = { workspace = true }
+tempfile = { workspace = true }
+toml = { workspace = true }
+ureq = { workspace = true }
+walkdir = { workspace = true }

@@ -15,10 +15,11 @@ use cargo::util::GlobalContext;
 use cargo_util_terminal::Shell;
 use semver::Version;
 use serde_derive::Serialize;
+use takopack_core::errors::Result;
+use takopack_core::takopack_bail;
 use toml::Value;
 
-use crate::cargo_packaging::local::materialize_manifest_backed_temp_crate;
-use crate::errors::Result;
+use crate::local::materialize_manifest_backed_temp_crate;
 
 #[derive(Debug, Clone)]
 pub struct ResolveReport {
@@ -78,7 +79,7 @@ fn prepare_single_crate(path: &Path, registry: Option<&Path>) -> Result<Prepared
     let manifest = resolve_manifest(path)?;
     validate_single_crate_manifest(&manifest)?;
 
-    let registry_dir = crate::config::resolve_registry_dir(registry)?;
+    let registry_dir = takopack_core::config::resolve_registry_dir(registry)?;
     if !registry_dir.is_dir() {
         takopack_bail!(
             "local registry directory does not exist: {}\n\
@@ -305,9 +306,10 @@ members = ["member"]
         .unwrap();
 
         let err = validate_single_crate_manifest(&manifest).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("workspace manifests are not supported"));
+        assert!(
+            err.to_string()
+                .contains("workspace manifests are not supported")
+        );
     }
 
     #[test]
