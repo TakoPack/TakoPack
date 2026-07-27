@@ -1,15 +1,11 @@
 [package]
 name = "takopack"
 version = "0.1.1"
-authors = [
-  "misaka00251 <liuxin@iscas.ac.cn>",
-  "yyjeqhc <jialin.oerv@isrc.iscas.ac.cn",
-]
-license = "MIT/Apache-2.0"
-repository = "https://github.com/TakoPack/TakoPack"
-description = "Generate Linux distribution RPM spec files from language package metadata."
 edition = "2024"
 rust-version = "1.94"
+description = "Generate Linux distribution RPM spec files from language package metadata."
+repository = "https://github.com/TakoPack/TakoPack"
+license.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }

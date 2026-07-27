@@ -1,4 +1,5 @@
 [workspace]
+package.license = "MIT OR Apache-2.0"
 resolver = "3"
 members = [
   "crates/takopack",
