@@ -30,10 +30,6 @@ impl<'a> PypiFetcher<'a> {
         }
     }
 
-    pub fn temp_dir(&mut self, path_str: &'a str) {
-        self.temp_root = Some(path_str);
-    }
-
     // Fetch from PyPI, validate and download the source tarball picked by version.
     pub fn fetch(&self) -> Result<Pypi<'a>, FetchError> {
         let pypi_package: PypiPackage =

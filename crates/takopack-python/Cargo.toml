@@ -5,23 +5,26 @@ edition = "2024"
 license.workspace = true
 
 [dependencies]
-anyhow = { workspace = true }
 flate2 = { workspace = true }
-regex = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+serde_path_to_error = { workspace = true }
 sha2 = { workspace = true }
-takopack-core = { workspace = true }
 tar = { workspace = true }
 tempfile = { workspace = true }
-toml = { workspace = true }
 ureq = { workspace = true, default-features = true, features = ["tls"] }
 
+# feature: cli
 clap = { workspace = true, optional = true }
-serde_path_to_error = "0.1.20"
+
+# feature: render
+regex = { workspace = true, optional = true }
+takopack-core = { workspace = true, optional = true }
+toml = { workspace = true, optional = true }
 
 [features]
 default = ["full"]
-cli = ["dep:clap"]
 full = ["cli", "render"]
-render = []
+
+cli = ["dep:clap"]
+render = ["dep:regex", "dep:takopack-core", "dep:toml"]

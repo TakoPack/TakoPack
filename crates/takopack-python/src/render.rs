@@ -300,44 +300,44 @@ fn finalize_meta(meta: &mut SpecMeta, fallback_name: &str) {
     };
 }
 
-fn render_skeleton_spec(
-    srcname: &str,
-    version: &str,
-    package_name: &str,
-    reason: &anyhow::Error,
-) -> String {
-    let mut out = String::new();
-    out.push_str(&format!("%global srcname {}\n\n", srcname));
-    out.push_str("Name:           python-%{srcname}\n");
-    out.push_str(&format!("Version:        {}\n", version));
-    out.push_str("Release:        %autorelease\n");
-    out.push_str("Summary:        \n");
-    out.push_str(&format!("License:        {}\n", FALLBACK_LICENSE));
-    out.push_str("URL:            \n");
-    out.push_str("#!RemoteAsset:  sha256:\n");
-    out.push_str("Source0:        \n");
-    out.push_str("BuildArch:      noarch\n");
-    out.push_str("BuildSystem:    pyproject\n\n");
-    out.push_str("BuildOption(install):  -l %{srcname}\n\n");
-    out.push_str("BuildRequires:  pyproject-rpm-macros\n");
-    out.push_str("BuildRequires:  pkgconfig(python3)\n\n");
-    out.push_str("Provides:       python3-%{srcname} = %{version}-%{release}\n");
-    out.push_str("%python_provide python3-%{srcname}\n\n");
-    out.push_str("%description\n");
-    out.push_str("TODO: PyPI package metadata/source archive unavailable, please fill in summary, license, URL and Source0 manually.\n\n");
-    out.push_str("%generate_buildrequires\n");
-    out.push_str("%pyproject_buildrequires\n\n");
-    out.push_str("%files -f %{pyproject_files}\n\n");
-    out.push_str("%changelog\n");
-    out.push_str("%autochangelog\n\n");
-    out.push_str("# Manual check note:\n");
-    out.push_str(&format!("# package: {}\n", package_name));
-    out.push_str(&format!(
-        "# reason: {}\n",
-        cleanup_single_line(&reason.to_string())
-    ));
-    out
-}
+// fn render_skeleton_spec(
+//     srcname: &str,
+//     version: &str,
+//     package_name: &str,
+//     reason: &anyhow::Error,
+// ) -> String {
+//     let mut out = String::new();
+//     out.push_str(&format!("%global srcname {}\n\n", srcname));
+//     out.push_str("Name:           python-%{srcname}\n");
+//     out.push_str(&format!("Version:        {}\n", version));
+//     out.push_str("Release:        %autorelease\n");
+//     out.push_str("Summary:        \n");
+//     out.push_str(&format!("License:        {}\n", FALLBACK_LICENSE));
+//     out.push_str("URL:            \n");
+//     out.push_str("#!RemoteAsset:  sha256:\n");
+//     out.push_str("Source0:        \n");
+//     out.push_str("BuildArch:      noarch\n");
+//     out.push_str("BuildSystem:    pyproject\n\n");
+//     out.push_str("BuildOption(install):  -l %{srcname}\n\n");
+//     out.push_str("BuildRequires:  pyproject-rpm-macros\n");
+//     out.push_str("BuildRequires:  pkgconfig(python3)\n\n");
+//     out.push_str("Provides:       python3-%{srcname} = %{version}-%{release}\n");
+//     out.push_str("%python_provide python3-%{srcname}\n\n");
+//     out.push_str("%description\n");
+//     out.push_str("TODO: PyPI package metadata/source archive unavailable, please fill in summary, license, URL and Source0 manually.\n\n");
+//     out.push_str("%generate_buildrequires\n");
+//     out.push_str("%pyproject_buildrequires\n\n");
+//     out.push_str("%files -f %{pyproject_files}\n\n");
+//     out.push_str("%changelog\n");
+//     out.push_str("%autochangelog\n\n");
+//     out.push_str("# Manual check note:\n");
+//     out.push_str(&format!("# package: {}\n", package_name));
+//     out.push_str(&format!(
+//         "# reason: {}\n",
+//         cleanup_single_line(&reason.to_string())
+//     ));
+//     out
+// }
 
 fn assign_preferred_url(meta: &mut SpecMeta, candidate: &str) {
     if let Some(git_url) = normalize_git_url(candidate) {
