@@ -60,6 +60,29 @@ fn fetch_candidates(registry: &mut PackageRegistry, dep: &Dependency) -> Result<
     Ok(summaries)
 }
 
+fn normalize_exact_prerelease_shorthand(version: &str) -> String {
+    let Some((release, prerelease)) = version.split_once('-') else {
+        return version.to_string();
+    };
+    if prerelease.is_empty() {
+        return version.to_string();
+    }
+    let mut parts = release.split('.');
+    let Some(major) = parts.next() else {
+        return version.to_string();
+    };
+    let Some(minor) = parts.next() else {
+        return version.to_string();
+    };
+    if parts.next().is_some()
+        || !major.chars().all(|c| c.is_ascii_digit())
+        || !minor.chars().all(|c| c.is_ascii_digit())
+    {
+        return version.to_string();
+    }
+    format!("{major}.{minor}.0-{prerelease}")
+}
+
 pub fn crate_name_ver_to_dep(crate_name: &str, version: Option<&str>) -> Result<Dependency> {
     // note: this forces a network call
     let context = GlobalContext::default()?;
@@ -68,7 +91,8 @@ pub fn crate_name_ver_to_dep(crate_name: &str, version: Option<&str>) -> Result<
         if v.is_empty() {
             None
         } else if v.starts_with(|c: char| c.is_ascii_digit()) {
-            Some(["=", v].concat())
+            let v = normalize_exact_prerelease_shorthand(v);
+            Some(["=", &v].concat())
         } else {
             Some(v.to_string())
         }
@@ -1192,8 +1216,8 @@ fn transitive_deps_impl<'a>(
 #[cfg(test)]
 mod tests {
     use super::{
-        all_dependencies_and_features, dependency_is_runtime_candidate,
-        dependency_matches_openruyi_linux_target,
+        all_dependencies_and_features, crate_name_ver_to_dep, dependency_is_runtime_candidate,
+        dependency_matches_openruyi_linux_target, normalize_exact_prerelease_shorthand,
     };
     use cargo::GlobalContext;
     use cargo::core::{Dependency, EitherManifest, SourceId, dependency::DepKind};
@@ -1225,6 +1249,30 @@ mod tests {
     fn test_dep(name: &str, version: &str) -> Dependency {
         let source_id = SourceId::for_path(&std::env::current_dir().unwrap()).unwrap();
         Dependency::parse(name, Some(version), source_id).unwrap()
+    }
+
+    #[test]
+    fn exact_prerelease_shorthand_adds_missing_patch_component() {
+        for (input, expected) in [
+            ("0.11-rc.3", "0.11.0-rc.3"),
+            ("1.2-beta.1", "1.2.0-beta.1"),
+            ("2.7-dev", "2.7.0-dev"),
+        ] {
+            assert_eq!(normalize_exact_prerelease_shorthand(input), expected);
+        }
+    }
+
+    #[test]
+    fn exact_prerelease_shorthand_leaves_other_inputs_unchanged() {
+        for input in ["0.11", "0.11.0-rc.3", ">=0.11-rc.3", "^0.11-rc.3", "0.11-"] {
+            assert_eq!(normalize_exact_prerelease_shorthand(input), input);
+        }
+    }
+
+    #[test]
+    fn exact_prerelease_shorthand_reaches_cargo_as_exact_full_semver() {
+        let dep = crate_name_ver_to_dep("aes-gcm", Some("0.11-rc.3")).unwrap();
+        assert_eq!(dep.version_req().to_string(), "=0.11.0-rc.3");
     }
 
     #[test]
