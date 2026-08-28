@@ -15,7 +15,7 @@ tempfile = { workspace = true }
 ureq = { workspace = true, default-features = true, features = ["tls"] }
 
 # feature: cli
-clap = { workspace = true, optional = true }
+clap = { workspace = true, optional = true, features = ["derive"] }
 
 # feature: render
 regex = { workspace = true, optional = true }
