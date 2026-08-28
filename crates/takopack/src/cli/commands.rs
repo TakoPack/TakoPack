@@ -6,10 +6,11 @@ use nu_ansi_term::Color::Red;
 use takopack_core::errors::Result;
 use takopack_python::cli::PythonSubcommands;
 use takopack_python::pypi::PypiFetcher;
+use takopack_rust::RustSubcommands;
 use takopack_rust::package::*;
 use takopack_rust::range_audit::{self, RangeCapabilityPolicy};
 
-use super::options::{CargoOpt, Cli, Opt};
+use super::options::{Cli, Opt};
 
 pub fn run() {
     env_logger::init();
@@ -27,13 +28,13 @@ fn real_main() -> Result<i32> {
     use Opt::*;
     match m.command {
         Cargo(cargo_opt) => match cargo_opt {
-            CargoOpt::Package {
+            RustSubcommands::Package {
                 init,
                 extract,
                 finish,
                 range_capability_policy,
             } => package_crate(init, extract, finish, range_capability_policy),
-            CargoOpt::LocalPackage {
+            RustSubcommands::LocalPackage {
                 path,
                 output,
                 finish,
@@ -48,18 +49,23 @@ fn real_main() -> Result<i32> {
                 )?;
                 Ok(0)
             }
-            CargoOpt::RegistrySync { dry_run, jobs } => {
+            RustSubcommands::RegistrySync { dry_run, jobs } => {
                 log::info!("starting registry sync");
                 takopack_rust::registry_sync::run_registry_sync(dry_run, jobs)
             }
-            CargoOpt::ResolveCheck { path, registry } => {
+            RustSubcommands::ResolveCheck { path, registry } => {
                 log::info!("starting resolve check");
                 takopack_rust::resolve_check::run_resolve_check(&path, registry.as_deref())
             }
-            CargoOpt::BuildReqs { path, registry } => {
+            RustSubcommands::BuildReqs { path, registry } => {
                 log::info!("generating dynamic BuildRequires");
                 takopack_rust::buildreqs::run_buildreqs(&path, registry.as_deref())
             }
+            RustSubcommands::Inspect {
+                target,
+                registry,
+                version,
+            } => inspect_crate(&target, registry, version),
         },
         Py(py_opt) => match py_opt {
             PythonSubcommands::Package { name, version, .. } => {
@@ -71,6 +77,76 @@ fn real_main() -> Result<i32> {
             }
         },
     }
+}
+
+fn inspect_crate(target: &str, registry: bool, version: Option<String>) -> Result<i32> {
+    use std::path::Path;
+    use takopack_rust::crates::{
+        CrateSource, LoadOptions, LocalPathSource, ManifestSource, RegistrySource, Source,
+        load_crate,
+    };
+
+    // Pick a source based on how `target` was passed.
+    let source = if registry {
+        Source::Registry(RegistrySource {
+            name: target.to_string(),
+            version,
+        })
+    } else {
+        let p = Path::new(target);
+        let is_manifest = p.is_file() && p.extension().and_then(|e| e.to_str()) == Some("toml");
+        if is_manifest {
+            Source::Manifest(ManifestSource {
+                path: p.to_path_buf(),
+            })
+        } else {
+            Source::LocalPath(LocalPathSource {
+                path: p.to_path_buf(),
+                name: None,
+                version: None,
+            })
+        }
+    };
+
+    log::info!(
+        "inspecting crate via new model pipeline: {}",
+        source.describe()
+    );
+    let model = load_crate(source, LoadOptions::default())?;
+
+    println!("Crate: {} {}", model.name, model.full_version);
+    println!("compat: {}", model.semver_compat);
+    println!("is_lib: {}", model.is_lib);
+    println!("binary targets: {:?}", model.binary_targets);
+    println!("targets:");
+    for t in &model.targets {
+        println!(
+            "  - {} ({:?}) {}",
+            t.name,
+            t.kind,
+            t.src_path.as_deref().unwrap_or("(no source path)")
+        );
+    }
+    println!("dependencies ({}):", model.dependencies.len());
+    for d in &model.dependencies {
+        println!(
+            "  - {} = \"{}\" kind={:?} runtime={}",
+            d.toml_name, d.version_req, d.kind, d.runtime_candidate
+        );
+    }
+    println!("features ({}):", model.features.len());
+    for (feature, node) in &model.features {
+        println!(
+            "  - {:?}: feature_deps={:?} crate_deps={:?}",
+            feature, node.feature_deps, node.crate_deps
+        );
+    }
+    println!(
+        "default transitive deps: {:?}",
+        model.transitive_deps("default")
+    );
+
+    Ok(0)
 }
 
 fn package_crate(

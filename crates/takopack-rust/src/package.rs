@@ -5,7 +5,7 @@ use takopack_core::config::Config;
 use takopack_core::errors::Result;
 use takopack_core::{takopack_info, takopack_warn, util};
 
-use crate::crates::CrateInfo;
+use crate::crates::crateinfo::CrateInfo;
 use crate::rpm::{self, RpmPackageInfo};
 
 pub struct PackageProcess {

@@ -9,7 +9,7 @@ use takopack_core::{
 };
 
 use crate::{
-    crates::dependency_is_runtime_candidate,
+    crates::crateinfo::dependency_is_runtime_candidate,
     rpm::spec::{
         self, CrateCapability, CrateRequirement, RequirementVersion, SpecPackage, SpecSource,
     },
@@ -745,7 +745,7 @@ pub fn rpm_feature_package_name(name: &str, feature: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{CrateDep, Source, crate_requirements_from_cargo_deps};
-    use crate::crates::{all_dependencies_and_features, transitive_deps};
+    use crate::crates::crateinfo::{all_dependencies_and_features, transitive_deps};
     use crate::rpm::spec;
 
     use cargo::GlobalContext;

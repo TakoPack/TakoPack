@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use semver::{Comparator, Op, Version, VersionReq};
 use takopack_core::util::calculate_compat_version;
 
-use crate::crates::dependency_is_runtime_candidate;
+use crate::crates::crateinfo::dependency_is_runtime_candidate;
 use crate::rpm::spec::normalize_crate_name;
 
 // ---------------------------------------------------------------------------

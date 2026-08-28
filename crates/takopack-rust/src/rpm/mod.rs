@@ -21,7 +21,7 @@ use self::spec::{
     SpecFiles, render_build_check_install_placeholder, render_changelog_section,
     render_files_section, render_patch_prep_placeholder,
 };
-use crate::crates::{CrateDepInfo, CrateInfo, all_dependencies_and_features, show_dep};
+use crate::crates::crateinfo::{CrateDepInfo, CrateInfo, all_dependencies_and_features, show_dep};
 
 pub mod metadata;
 pub mod spec;

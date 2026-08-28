@@ -7,7 +7,7 @@ use takopack_core::config::Config;
 use takopack_core::util::write_file_ensuring_dir;
 use toml::Value;
 
-use crate::crates::CrateInfo;
+use crate::crates::crateinfo::CrateInfo;
 use crate::package::PackageExecuteArgs;
 use crate::range_audit::{self, RangeCapabilityPolicy};
 
